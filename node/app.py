@@ -12,8 +12,9 @@ from dataclasses import asdict
 
 from fastapi import FastAPI, HTTPException
 from blockchain import Block, Blockchain
-from consensus import is_valid_proof, proof_of_work
+from consensus import is_valid_proof, proof_of_work, select_validator
 from p2p import PeerRegistry
+from wallet import verify_signature
 
 app = FastAPI()
 
@@ -110,6 +111,31 @@ def get_balance(public_key: str):
     return {"public_key": public_key, "balance": blockchain.get_balance(public_key)}
 
 
+@app.post("/stake")
+def stake(public_key: str, amount: float, signature: str):
+    """
+    Phase 11: signature is pre-computed client-side (same pattern as
+    /transactions/new — the caller's Wallet signs
+    {"from": public_key, "to": f"STAKE:{public_key}", "amount": amount}
+    locally and submits the result here), so the server never needs a
+    private key to verify it's really that wallet choosing to stake.
+    """
+    try:
+        blockchain.stake(public_key, amount, signature)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"message": "Stake transaction added to mempool"}
+
+
+@app.get("/validators")
+def get_validators():
+    """
+    Confirmed-chain-only, same rule as /balance — a stake sitting
+    unmined in the mempool isn't an active validator yet.
+    """
+    return blockchain.get_active_validators()
+
+
 @app.post("/nodes/register")
 def register_node(node_address: str):
     registry.register(node_address)
@@ -138,12 +164,29 @@ def receive_block(block: dict, broadcast: bool = True):
     stops us from re-announcing a block we just received, which would
     ping-pong it forever between mutually-registered peers — same fix
     as new_transaction's broadcast flag.
+
+    Phase 11: a PoS block (validator_public_key set) is recorded as a
+    proposal before anything else, win or lose — this is the "received
+    block" half of equivocation tracking (the other half is /mine's own
+    proposals). If that reveals a second, different block from the same
+    validator at the same index, the validator is slashed immediately and
+    this block is rejected regardless of whether it would otherwise have
+    extended our chain.
     """
     incoming = Block(**block)
 
-    if incoming.previous_hash == blockchain.last_block.hash and is_valid_proof(
-        incoming, Blockchain.difficulty
+    if incoming.validator_public_key and blockchain.record_proposal(
+        incoming.validator_public_key, incoming.index, incoming.hash
     ):
+        return {"message": "Equivocation detected, validator slashed", "index": incoming.index}
+
+    if incoming.validator_public_key:
+        header = {"index": incoming.index, "previous_hash": incoming.previous_hash}
+        proof_ok = verify_signature(header, incoming.validator_signature, incoming.validator_public_key)
+    else:
+        proof_ok = is_valid_proof(incoming, blockchain.difficulty)
+
+    if incoming.previous_hash == blockchain.last_block.hash and proof_ok:
         blockchain.add_block(incoming)
         blockchain.pending_transactions = []
         if broadcast:
@@ -160,10 +203,11 @@ def receive_block(block: dict, broadcast: bool = True):
 
 
 @app.get("/mine")
-def mine(miner_public_key: str):
+def mine(miner_public_key: str, validator_signature: str = None):
     """
-    Build a candidate block from whatever's in the mempool, spend the
-    proof-of-work to earn the right to append it, then tell peers.
+    Build a candidate block from whatever's in the mempool, then either
+    spend proof-of-work or (Phase 11, CONSENSUS_MODE=pos) get it signed
+    by the round's selected validator, and tell peers.
 
     Candidate fields are all derived from current chain state (index and
     previous_hash both come from last_block) rather than passed in —
@@ -177,6 +221,19 @@ def mine(miner_public_key: str):
     them. The miner is paid BLOCK_REWARD plus every included transaction's
     fee, folded into one COINBASE transaction rather than paid out
     per-transaction — see Blockchain.get_balance for why that's simpler.
+
+    Phase 11: CONSENSUS_MODE is read fresh here (not imported as a cached
+    constant from consensus.py) so a node's mode can't get stuck on
+    whatever it was at process startup. In "pos" mode, anyone can still
+    call this endpoint, but only the validator select_validator() actually
+    picked for this round succeeds — everyone else gets 403. That's what
+    makes the selection meaningful instead of decorative: the caller
+    proves it's really that validator by pre-signing the block's header
+    (index + previous_hash, the two fields it can know in advance) with
+    its own private key and passing the signature in, the same way a
+    transaction's signature is computed client-side and submitted. The
+    server never sees, needs, or could plausibly hold every validator's
+    private key.
     """
     pending = blockchain.pending_transactions
     ranked_indices = sorted(
@@ -199,8 +256,35 @@ def mine(miner_public_key: str):
         transactions=selected + [coinbase],
         previous_hash=blockchain.last_block.hash,
     )
-    proof_of_work(candidate, Blockchain.difficulty)
-    candidate.hash = candidate.compute_hash()
+
+    if os.environ.get("CONSENSUS_MODE", "pow") == "pos":
+        active_validators = blockchain.get_active_validators()
+        if not active_validators:
+            raise HTTPException(status_code=400, detail="No active validators")
+
+        selected_validator = select_validator(active_validators)
+        if selected_validator != miner_public_key:
+            raise HTTPException(
+                status_code=403, detail="Not the validator selected for this round"
+            )
+
+        header = {"index": candidate.index, "previous_hash": candidate.previous_hash}
+        if not validator_signature or not verify_signature(
+            header, validator_signature, miner_public_key
+        ):
+            raise HTTPException(status_code=400, detail="Invalid or missing validator signature")
+
+        candidate.hash = candidate.compute_hash()
+        candidate.validator_public_key = miner_public_key
+        candidate.validator_signature = validator_signature
+
+        if blockchain.record_proposal(miner_public_key, candidate.index, candidate.hash):
+            raise HTTPException(
+                status_code=403, detail="Equivocation detected — validator slashed"
+            )
+    else:
+        proof_of_work(candidate, blockchain.difficulty)
+        candidate.hash = candidate.compute_hash()
 
     blockchain.add_block(candidate)
     blockchain.pending_transactions = remaining

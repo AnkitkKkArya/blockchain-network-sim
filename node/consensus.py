@@ -4,6 +4,7 @@ Phase 6 (stretch): Proof of Stake mode, toggled by CONSENSUS_MODE.
 """
 
 import os
+import random
 
 CONSENSUS_MODE = os.environ.get("CONSENSUS_MODE", "pow")  # "pow" or "pos"
 
@@ -44,9 +45,19 @@ def is_valid_proof(block, difficulty: int) -> bool:
 
 def select_validator(stakes: dict) -> str:
     """
-    Phase 6 stretch. TODO: pick a validator address, weighted by stake
-    (e.g. random.choices with weights=list(stakes.values())).
-    Compare this file's two consensus paths side by side once both work —
-    that comparison is the actual point of building this phase.
+    Phase 11: weighted-by-stake random selection — a validator with a
+    bigger stake is proportionally more likely to be picked for this
+    round, but never guaranteed to win one. This is what makes "stake"
+    meaningful without needing verifiable randomness (VRF): every node
+    computes the same selection from the same stakes dict independently.
+
+    Returns None for an empty stakes dict (no active validators to pick
+    from) rather than raising — callers (app.py's /mine) treat that as
+    "no PoS block can be produced this round," not an error in the
+    selection logic itself.
     """
-    raise NotImplementedError
+    if not stakes:
+        return None
+    validators = list(stakes.keys())
+    weights = list(stakes.values())
+    return random.choices(validators, weights=weights, k=1)[0]

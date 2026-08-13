@@ -22,6 +22,13 @@ class Block:
     previous_hash: str
     nonce: int = 0
     hash: str = field(default="")
+    # Phase 11: set only for PoS-mined blocks (the validator that signed
+    # this block, and its signature over the block's header). None for
+    # every PoW block, including all Phase 1-10 blocks/tests — neither
+    # field is part of compute_hash()'s payload, so adding them here
+    # doesn't change any existing block's hash.
+    validator_public_key: str = None
+    validator_signature: str = None
 
     def compute_hash(self) -> str:
         """
@@ -47,13 +54,27 @@ class Block:
 
 
 class Blockchain:
-    difficulty = 4  # leading zeros required — used from Phase 4 onward
     BLOCK_REWARD = 10.0
     MAX_TRANSACTIONS_PER_BLOCK = 3  # small on purpose, so prioritization is easy to observe/test
+    TARGET_BLOCK_TIME = 2  # seconds
+    ADJUSTMENT_INTERVAL = 5  # blocks
+    BURN_ADDRESS = "BURNED"  # Phase 11: slashed stake lands here, unspendable by anyone
 
     def __init__(self, initial_balances: dict = None):
         self.chain: list[Block] = []
         self.pending_transactions: list = []
+        # Phase 10: an instance attribute, not a class attribute — each
+        # Blockchain adjusts its own difficulty based on its own mining
+        # pace, and a class attribute would leak one instance's adjustment
+        # onto every other instance sharing the class (e.g. across tests).
+        self.difficulty = 4  # leading zeros required — used from Phase 4 onward
+        # Phase 11: every validator block proposal ever seen (accepted
+        # onto this chain or not), keyed by (validator_public_key, index).
+        # This is what equivocation detection compares against — a
+        # validator signing two different blocks at the same index is
+        # only visible here, not in self.chain, since at most one of the
+        # two ever lands on any given node's chain.
+        self.validator_proposals: dict = {}
         self.create_genesis_block(initial_balances)
 
     def create_genesis_block(self, initial_balances: dict = None):
@@ -143,6 +164,87 @@ class Blockchain:
                     balance -= transaction.get("amount", 0) + transaction.get("fee", 0)
         return balance
 
+    def stake(self, validator_public_key: str, amount: float, signature: str):
+        """
+        Phase 11: staking is a real, signature-verified spend from
+        validator_public_key to the synthetic address
+        f"STAKE:{validator_public_key}" — going through add_transaction()'s
+        normal signature/balance checks means becoming a validator costs
+        something and can't be forged, same as any other transfer. Like
+        any transaction, this only lands in the mempool; it isn't counted
+        by get_stake()/get_active_validators() (confirmed-chain-only,
+        same rule as get_balance()) until a block including it is mined.
+        """
+        transaction = {
+            "from": validator_public_key,
+            "to": f"STAKE:{validator_public_key}",
+            "amount": amount,
+            "sender_public_key": validator_public_key,
+            "signature": signature,
+        }
+        self.add_transaction(transaction)
+
+    def get_stake(self, validator_public_key: str) -> float:
+        return self.get_balance(f"STAKE:{validator_public_key}")
+
+    def get_active_validators(self) -> dict:
+        """
+        Every public key that ever self-staked (sent a transaction to its
+        own f"STAKE:{...}" address), mapped to its current stake, filtered
+        to stake > 0 — so a validator slashed down to nothing drops out
+        without needing separate bookkeeping.
+        """
+        validators = set()
+        for block in self.chain:
+            for transaction in block.transactions:
+                sender = transaction.get("from")
+                if sender and transaction.get("to") == f"STAKE:{sender}":
+                    validators.add(sender)
+        return {v: self.get_stake(v) for v in validators if self.get_stake(v) > 0}
+
+    def slash(self, validator_public_key: str):
+        """
+        Burns a validator's entire current stake by minting a transaction
+        from its f"STAKE:{...}" address to BURN_ADDRESS directly into a new
+        block, the same way genesis mints GENESIS transactions directly
+        rather than through add_transaction(): there's no private key for
+        a "STAKE:<pubkey>" address to authorize a withdrawal with, and
+        this is a protocol-level penalty the validator never agrees to,
+        not a transfer it signs. It has to land on-chain immediately
+        (not the mempool) since get_stake() only reads confirmed balance.
+        """
+        stake_address = f"STAKE:{validator_public_key}"
+        amount = self.get_balance(stake_address)
+        if amount <= 0:
+            return
+        burn_transaction = {"from": stake_address, "to": self.BURN_ADDRESS, "amount": amount}
+        block = Block(
+            index=self.last_block.index + 1,
+            timestamp=time.time(),
+            transactions=[burn_transaction],
+            previous_hash=self.last_block.hash,
+        )
+        block.hash = block.compute_hash()
+        self.add_block(block)
+
+    def record_proposal(self, validator_public_key: str, index: int, block_hash: str) -> bool:
+        """
+        Records a validator's block proposal at a given index, and
+        returns True iff this call just revealed equivocation (slashing
+        the validator as a side effect). Tracking every proposal seen —
+        not just ones that land on this node's own chain — is what
+        catches a validator handing two different blocks for the same
+        index to two different peers, even though at most one of those
+        blocks is ever accepted by any single node.
+        """
+        key = (validator_public_key, index)
+        seen_hash = self.validator_proposals.get(key)
+        if seen_hash is not None and seen_hash != block_hash:
+            self.slash(validator_public_key)
+            return True
+        self.validator_proposals[key] = block_hash
+        return False
+
     def add_block(self, block: Block) -> None:
         """
         Append a block the caller has already validated — proof-of-work
@@ -151,8 +253,46 @@ class Blockchain:
         chain; deciding whether a block is acceptable is a separate
         concern the caller (app.py's /mine and /blocks/receive) owns,
         same way is_chain_valid() stays pure validation with no mutation.
+
+        adjust_difficulty() runs here rather than being called separately
+        by each caller, since this is the one place every accepted block
+        (mined locally or received from a peer) actually lands on the chain.
         """
         self.chain.append(block)
+        self.adjust_difficulty()
+
+    def adjust_difficulty(self):
+        """
+        Phase 10: every ADJUSTMENT_INTERVAL blocks, compare how long that
+        window actually took against TARGET_BLOCK_TIME * ADJUSTMENT_INTERVAL,
+        and nudge difficulty up (mining too fast) or down (too slow, floored
+        at 1) accordingly. Left unchanged if elapsed time is within 2x of
+        target in either direction — small variance is expected noise, not
+        a signal to react to.
+
+        The window's lower bound is deliberately excluded when it's genesis
+        (index 0): genesis's timestamp is hardcoded to 0 (see
+        create_genesis_block), not a real wall-clock moment, so using it in
+        an elapsed-time calculation would produce a huge, meaningless
+        "elapsed" and spuriously ratchet difficulty up on the very first
+        adjustment window.
+        """
+        chain_length = len(self.chain)
+        if chain_length % self.ADJUSTMENT_INTERVAL != 0:
+            return
+        if chain_length <= self.ADJUSTMENT_INTERVAL:
+            return
+
+        window_start = self.chain[-1 - self.ADJUSTMENT_INTERVAL]
+        if window_start.index == 0:
+            return
+
+        elapsed = self.chain[-1].timestamp - window_start.timestamp
+        target = self.TARGET_BLOCK_TIME * self.ADJUSTMENT_INTERVAL
+        if elapsed < target / 2:
+            self.difficulty += 1
+        elif elapsed > target * 2:
+            self.difficulty = max(1, self.difficulty - 1)
 
     def is_chain_valid(self, chain: list[Block] = None) -> bool:
         """
