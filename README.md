@@ -1,5 +1,7 @@
 # Blockchain network simulation
 
+[![tests](https://github.com/AnkitkKkArya/blockchain-network-sim/actions/workflows/tests.yml/badge.svg)](https://github.com/AnkitkKkArya/blockchain-network-sim/actions/workflows/tests.yml)
+
 A multi-node blockchain simulation, built phase by phase to internalize the mechanics
 (hashing/chaining, P2P propagation, consensus, forks, containerized networking).
 
