@@ -210,6 +210,21 @@ def register_node(node_address: str):
     return {"message": f"Registered peer {node_address}"}
 
 
+@app.get("/peers")
+def get_peers():
+    """
+    Phase 16: visibility into which known peers are actually reachable.
+    "active" is exactly the broadcast/resolve target list
+    (PeerRegistry.active_peers()); "inactive" ones aren't forgotten —
+    just paused after FAILURE_THRESHOLD consecutive failures, and drop
+    back to active on the next successful contact or /nodes/register.
+    """
+    return {
+        "active": sorted(registry.active_peers()),
+        "inactive": sorted(registry.inactive_peers),
+    }
+
+
 @app.post("/blocks/receive")
 def receive_block(block: dict, broadcast: bool = True):
     """

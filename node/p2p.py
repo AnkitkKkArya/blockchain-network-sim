@@ -12,29 +12,60 @@ from blockchain import Block, validate_chain, validate_chain_economics
 
 
 class PeerRegistry:
+    # Phase 16: consecutive broadcast/request failures before a peer is
+    # paused. Small on purpose — a genuinely flaky peer should drop out
+    # quickly rather than eating a multi-second timeout on every single
+    # broadcast for a long time.
+    FAILURE_THRESHOLD = 3
+
     def __init__(self):
-        self.peers: set[str] = set()  # e.g. {"http://node2:5000"}
+        self.peers: set[str] = set()  # every peer ever registered — never forgotten
+        self.inactive_peers: set[str] = set()  # a subset of self.peers, currently paused
+        self.failure_counts: dict[str, int] = {}  # consecutive failures, per peer
 
     def register(self, address: str):
-        """Add address to self.peers."""
+        """
+        Add address to self.peers. A (re-)register — manual or repeated —
+        also reactivates the peer and resets its failure count: treating
+        an explicit /nodes/register call as a fresh signal the peer is
+        expected to be reachable again, same as a successful response
+        would.
+        """
         self.peers.add(address)
+        self.failure_counts[address] = 0
+        self.inactive_peers.discard(address)
+
+    def active_peers(self) -> set:
+        """Known peers minus the ones paused for repeated failures — the actual broadcast/request target list."""
+        return self.peers - self.inactive_peers
+
+    def _record_success(self, peer: str):
+        self.failure_counts[peer] = 0
+        self.inactive_peers.discard(peer)
+
+    def _record_failure(self, peer: str):
+        self.failure_counts[peer] = self.failure_counts.get(peer, 0) + 1
+        if self.failure_counts[peer] >= self.FAILURE_THRESHOLD:
+            self.inactive_peers.add(peer)
 
     def broadcast_transaction(self, transaction: dict):
         """
-        POST transaction to /transactions/new on every peer.
+        POST transaction to /transactions/new on every active peer.
         Done-when: two locally running nodes end up with the same
         pending_transactions after one receives a new transaction.
 
         A peer being down/unreachable shouldn't block the local add or
         the rest of the broadcast — this is best-effort propagation, not
-        a transaction that must atomically land everywhere.
+        a transaction that must atomically land everywhere. Repeated
+        failures against the same peer now feed into Phase 16's health
+        tracking rather than being silently retried forever.
 
         Sends broadcast=False so the receiving node adds it locally but
         doesn't re-broadcast: with mutually-registered peers, an
         unconditional rebroadcast on receipt would ping-pong the same
         transaction back and forth forever.
         """
-        for peer in self.peers:
+        for peer in self.active_peers():
             try:
                 requests.post(
                     f"{peer}/transactions/new",
@@ -42,21 +73,24 @@ class PeerRegistry:
                     params={"broadcast": False},
                     timeout=5,
                 )
+                self._record_success(peer)
             except requests.RequestException:
+                self._record_failure(peer)
                 continue
 
     def broadcast_block(self, block_dict: dict):
         """
-        Notify every peer a new block was mined, so they can validate and
-        either accept it or resolve a fork. Same best-effort semantics as
-        broadcast_transaction — an unreachable peer just misses this
-        announcement and will catch up later via resolve_conflicts().
+        Notify every active peer a new block was mined, so they can
+        validate and either accept it or resolve a fork. Same
+        best-effort semantics as broadcast_transaction — an unreachable
+        peer just misses this announcement and will catch up later via
+        resolve_conflicts(), and repeated failures pause it the same way.
 
         Sends broadcast=False for the same reason as broadcast_transaction:
         with mutually-registered peers, a receiving node that unconditionally
         rebroadcast an accepted block back out would ping-pong it forever.
         """
-        for peer in self.peers:
+        for peer in self.active_peers():
             try:
                 requests.post(
                     f"{peer}/blocks/receive",
@@ -64,14 +98,16 @@ class PeerRegistry:
                     params={"broadcast": False},
                     timeout=5,
                 )
+                self._record_success(peer)
             except requests.RequestException:
+                self._record_failure(peer)
                 continue
 
     def resolve_conflicts(self, local_chain: list) -> list:
         """
-        Fetch /chain from every peer, and if a longer *valid* chain
-        exists, replace local_chain with it. This is the longest-chain
-        rule — the actual fork-resolution mechanism.
+        Fetch /chain from every active peer, and if a longer *valid*
+        chain exists, replace local_chain with it. This is the
+        longest-chain rule — the actual fork-resolution mechanism.
 
         Peer chains arrive as plain dicts over HTTP, so they're rebuilt
         into Block objects before validate_chain() can recompute hashes
@@ -87,11 +123,13 @@ class PeerRegistry:
         longest_chain = local_chain
         max_length = len(local_chain)
 
-        for peer in self.peers:
+        for peer in self.active_peers():
             try:
                 response = requests.get(f"{peer}/chain", timeout=5)
                 response.raise_for_status()
+                self._record_success(peer)
             except requests.RequestException:
+                self._record_failure(peer)
                 continue
 
             peer_chain = [Block(**block) for block in response.json().get("chain", [])]
