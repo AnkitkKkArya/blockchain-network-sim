@@ -10,7 +10,7 @@ import json
 import time
 from dataclasses import dataclass, field
 
-from merkle import merkle_root
+from merkle import merkle_root as compute_merkle_root
 from wallet import verify_signature
 
 
@@ -29,6 +29,10 @@ class Block:
     # doesn't change any existing block's hash.
     validator_public_key: str = None
     validator_signature: str = None
+    # Phase 14: stored header field (like hash), populated lazily by
+    # compute_hash() below. Exposing it lets a light client validate
+    # headers and merkle proofs without ever touching transaction data.
+    merkle_root: str = field(default="")
 
     def compute_hash(self) -> str:
         """
@@ -36,16 +40,28 @@ class Block:
         Serialize index, timestamp, previous_hash, nonce deterministically
         (sorted keys!) and return the SHA-256 hex digest.
 
-        Phase 8: transactions are folded in via merkle_root(transactions)
-        rather than the raw list. Same tamper-evidence as before (any
-        transaction change still changes this hash), but it's what lets
-        merkle_proof/verify_merkle_proof prove one transaction's presence
-        without needing the whole block.
+        Phase 8: transactions are folded in via merkle_root rather than
+        the raw list. Phase 14: that merkle_root is computed once and
+        cached on self.merkle_root (rather than recomputed from
+        self.transactions on every call) — proof_of_work calls
+        compute_hash() on every nonce increment with transactions that
+        never change during that loop, so recomputing the whole tree
+        every time was pure waste. Behavior-identical to before: same
+        resulting hash for the same transactions, just computed once.
+
+        This caching does mean compute_hash() alone no longer re-derives
+        merkle_root from self.transactions once it's set (e.g. a Block
+        reconstructed from a peer's dict that already carries a
+        merkle_root value) — is_chain_valid() independently re-derives
+        and compares it, so a block with transactions that don't match
+        its own stored merkle_root is still caught there.
         """
+        if not self.merkle_root:
+            self.merkle_root = compute_merkle_root(self.transactions)
         block_contents = {
             "index": self.index,
             "timestamp": self.timestamp,
-            "merkle_root": merkle_root(self.transactions),
+            "merkle_root": self.merkle_root,
             "previous_hash": self.previous_hash,
             "nonce": self.nonce,
         }
@@ -412,10 +428,19 @@ class Blockchain:
         stored hash, at block N+1's previous_hash link (check 2) — unless
         every subsequent block is re-hashed too, which is the whole point
         of proof-of-work costing something (Phase 4).
+
+        Phase 14: compute_hash() caches merkle_root rather than
+        recomputing it every call, so a block reconstructed with an
+        already-set (but forged/stale) merkle_root paired with different
+        transactions would pass check 1 without this — merkle_root is
+        independently re-derived from block.transactions and compared
+        here, closing that gap without giving up the caching.
         """
         chain = self.chain if chain is None else chain
         for i, block in enumerate(chain):
             if block.hash != block.compute_hash():
+                return False
+            if block.merkle_root != compute_merkle_root(block.transactions):
                 return False
             if i > 0 and block.previous_hash != chain[i - 1].hash:
                 return False

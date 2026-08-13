@@ -13,6 +13,7 @@ from dataclasses import asdict
 from fastapi import FastAPI, HTTPException
 from blockchain import Block, Blockchain
 from consensus import is_valid_proof, proof_of_work, select_validator
+from merkle import merkle_proof
 from p2p import PeerRegistry
 from wallet import verify_signature
 
@@ -134,6 +135,53 @@ def get_validators():
     unmined in the mempool isn't an active validator yet.
     """
     return blockchain.get_active_validators()
+
+
+@app.get("/headers")
+def get_headers():
+    """
+    Phase 14: what a light client fetches — never full block bodies.
+    Exactly the fields Block.compute_hash() hashes (index, timestamp,
+    previous_hash, nonce, merkle_root) plus the block's own hash, so a
+    light client can validate self-consistency + linkage entirely on its
+    own without ever touching transaction data.
+    """
+    return {
+        "headers": [
+            {
+                "index": block.index,
+                "timestamp": block.timestamp,
+                "previous_hash": block.previous_hash,
+                "nonce": block.nonce,
+                "merkle_root": block.merkle_root,
+                "hash": block.hash,
+            }
+            for block in blockchain.chain
+        ]
+    }
+
+
+@app.get("/block/{index}/proof")
+def get_block_proof(index: int, tx_index: int):
+    """
+    Phase 14: a full node serves proofs on request so light clients never
+    need full block bodies — merkle_proof() (Phase 8) does the actual
+    work; this just looks up the right block/transaction and returns it
+    alongside the block's merkle_root for the light client to check
+    against its own already-validated header.
+    """
+    if index < 0 or index >= len(blockchain.chain):
+        raise HTTPException(status_code=404, detail="Block index out of range")
+    block = blockchain.chain[index]
+    if tx_index < 0 or tx_index >= len(block.transactions):
+        raise HTTPException(status_code=404, detail="Transaction index out of range")
+    return {
+        "index": index,
+        "tx_index": tx_index,
+        "transaction": block.transactions[tx_index],
+        "proof": merkle_proof(block.transactions, tx_index),
+        "merkle_root": block.merkle_root,
+    }
 
 
 @app.post("/nodes/register")
