@@ -55,6 +55,30 @@ class Wallet:
             format=serialization.PublicFormat.SubjectPublicKeyInfo,
         ).decode()
 
+    @property
+    def private_key_pem(self) -> str:
+        """
+        Phase 18: lets a wallet be saved to disk and reloaded later (the
+        CLI wallet tool's `generate` + every other subcommand) — nothing
+        before this phase needed a wallet to outlive one process. No
+        password/encryption on the PEM: this project's "private keys"
+        are already throwaway/local-dev-only (see docker-compose.yml's
+        seed wallet), not something meant to protect real value.
+        """
+        return self._private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        ).decode()
+
+    @classmethod
+    def from_private_key_pem(cls, pem: str) -> "Wallet":
+        """Reconstructs a Wallet from private_key_pem's output — the CLI's load path."""
+        wallet = cls.__new__(cls)
+        wallet._private_key = serialization.load_pem_private_key(pem.encode(), password=None)
+        wallet.public_key = wallet._private_key.public_key()
+        return wallet
+
     def sign_transaction(self, transaction: dict) -> str:
         """
         Sign the transaction's content with this wallet's private key.
