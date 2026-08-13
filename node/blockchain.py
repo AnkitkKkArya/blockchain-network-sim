@@ -8,7 +8,7 @@ and unit-tested before moving to app.py (Phase 2).
 import hashlib
 import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
 from merkle import merkle_root as compute_merkle_root
 from wallet import verify_signature
@@ -359,6 +359,60 @@ class Blockchain:
             )
 
         return True
+
+    def save_to_disk(self, path: str):
+        """
+        Phase 15: persists what's needed to reconstruct an identical
+        Blockchain (same block hashes) on the next process/container
+        start — the chain itself (every stored Block field, including
+        hash/merkle_root/nonce, so load_from_disk() never re-mines or
+        re-derives anything) and validator_proposals (Phase 11's
+        equivocation-tracking dict — a restart shouldn't forget proposals
+        already seen and let a validator equivocate for free). difficulty
+        is included too, alongside what was explicitly asked for: without
+        it, a restart would silently reset mining cost back to the class
+        default regardless of how far adjust_difficulty() had actually
+        moved it.
+
+        pending_transactions is deliberately NOT persisted — the mempool
+        is ephemeral/in-flight data other nodes still hold and will
+        re-broadcast, unlike the chain itself.
+
+        validator_proposals' keys are (validator_public_key, index)
+        tuples, which JSON can't use as object keys, so they're written
+        out as a list of {validator, index, hash} entries instead.
+        """
+        data = {
+            "chain": [asdict(block) for block in self.chain],
+            "validator_proposals": [
+                {"validator": validator, "index": index, "hash": block_hash}
+                for (validator, index), block_hash in self.validator_proposals.items()
+            ],
+            "difficulty": self.difficulty,
+        }
+        with open(path, "w") as f:
+            json.dump(data, f)
+
+    @classmethod
+    def load_from_disk(cls, path: str) -> "Blockchain":
+        """
+        Reconstructs a Blockchain from save_to_disk()'s output.
+        cls.__new__(cls) bypasses __init__ (and its create_genesis_block()
+        call) entirely — the loaded chain already has its own genesis
+        block as chain[0], so building a fresh one first would only mean
+        immediately throwing it away.
+        """
+        with open(path) as f:
+            data = json.load(f)
+        blockchain = cls.__new__(cls)
+        blockchain.chain = [Block(**block_data) for block_data in data["chain"]]
+        blockchain.pending_transactions = []
+        blockchain.difficulty = data.get("difficulty", 4)
+        blockchain.validator_proposals = {
+            (entry["validator"], entry["index"]): entry["hash"]
+            for entry in data.get("validator_proposals", [])
+        }
+        return blockchain
 
     def add_block(self, block: Block) -> None:
         """

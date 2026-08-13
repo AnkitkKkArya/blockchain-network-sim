@@ -15,47 +15,72 @@
 x-initial-balances: &initial-balances
   INITIAL_BALANCES: '{"-----BEGIN PUBLIC KEY-----\nMFYwEAYHKoZIzj0CAQYFK4EEAAoDQgAEVxVbizWZUIzP/OMOPfYWNFRPuqG4ZvyU\nLb6/+5miGM6l59zvZaFJ8+pCpuxyE/aosCN6ZcJ+SutOV4CzGwNfzg==\n-----END PUBLIC KEY-----\n":100.0}'
 
+# Phase 15: each node gets its own named volume mounted at /data, and
+# CHAIN_STORAGE_PATH points inside it — chain state survives container
+# recreation instead of resetting to genesis every `docker-compose up`.
+# One volume per node (not shared) since each node's chain is its own
+# independent copy, same as its in-memory state always was.
+x-chain-storage: &chain-storage
+  CHAIN_STORAGE_PATH: /data/chain.json
+
 services:
   node1:
     build: ./node
     ports: ["5001:5000"]
     environment:
-      <<: *initial-balances
+      <<: [*initial-balances, *chain-storage]
       SEED_PEERS: http://node2:5000,http://node3:5000
+    volumes:
+      - node1-data:/data
     networks: [chainnet]
 
   node2:
     build: ./node
     ports: ["5002:5000"]
     environment:
-      <<: *initial-balances
+      <<: [*initial-balances, *chain-storage]
       SEED_PEERS: http://node1:5000,http://node3:5000
+    volumes:
+      - node2-data:/data
     networks: [chainnet]
 
   node3:
     build: ./node
     ports: ["5003:5000"]
     environment:
-      <<: *initial-balances
+      <<: [*initial-balances, *chain-storage]
       SEED_PEERS: http://node1:5000,http://node2:5000
+    volumes:
+      - node3-data:/data
     networks: [chainnet]
 
   node4:
     build: ./node
     ports: ["5004:5000"]
     environment:
-      <<: *initial-balances
+      <<: [*initial-balances, *chain-storage]
       SEED_PEERS: http://node1:5000,http://node2:5000,http://node3:5000
+    volumes:
+      - node4-data:/data
     networks: [chainnet]
 
   node5:
     build: ./node
     ports: ["5005:5000"]
     environment:
-      <<: *initial-balances
+      <<: [*initial-balances, *chain-storage]
       SEED_PEERS: http://node1:5000,http://node2:5000,http://node3:5000
+    volumes:
+      - node5-data:/data
     networks: [chainnet]
 
 networks:
   chainnet:
     driver: bridge
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+  node4-data:
+  node5-data:

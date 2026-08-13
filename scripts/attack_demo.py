@@ -207,7 +207,13 @@ def main():
     fund_attacker_in_compose(attacker.public_key_pem)
 
     banner("Bringing up the 5-node network")
-    compose("down")
+    # Phase 15: each node now persists its chain to a named volume
+    # (CHAIN_STORAGE_PATH), which `docker-compose down` alone does NOT
+    # remove — without -v, a second run of this script would load each
+    # node's STALE chain from a previous run instead of starting fresh
+    # from the newly-funded attacker wallet's genesis, breaking this
+    # demo's fresh-network assumption.
+    compose("down", "-v")
     compose("up", "-d", "--build")
     wait_for_nodes(list(HONEST_PORTS.values()) + [NODE5_PORT])
 

@@ -27,8 +27,28 @@ app = FastAPI()
 # match. Unset means {} — an empty genesis, matching current test
 # behavior/local single-node dev.
 initial_balances = json.loads(os.environ.get("INITIAL_BALANCES", "{}"))
-blockchain = Blockchain(initial_balances=initial_balances)
+
+# Phase 15: CHAIN_STORAGE_PATH opts a node into surviving restarts/
+# container recreation. Unset (the default, and every existing test's
+# behavior) means purely in-memory, unchanged from before this phase.
+# Set but the file doesn't exist yet (first boot) means build fresh
+# from INITIAL_BALANCES same as always, then save immediately so a
+# crash one block later still has genesis to fall back to.
+CHAIN_STORAGE_PATH = os.environ.get("CHAIN_STORAGE_PATH")
+if CHAIN_STORAGE_PATH and os.path.exists(CHAIN_STORAGE_PATH):
+    blockchain = Blockchain.load_from_disk(CHAIN_STORAGE_PATH)
+else:
+    blockchain = Blockchain(initial_balances=initial_balances)
+    if CHAIN_STORAGE_PATH:
+        blockchain.save_to_disk(CHAIN_STORAGE_PATH)
+
 registry = PeerRegistry()
+
+
+def persist_chain():
+    """Called after every point the chain actually changes (mine, receive, resolve)."""
+    if CHAIN_STORAGE_PATH:
+        blockchain.save_to_disk(CHAIN_STORAGE_PATH)
 
 
 @app.on_event("startup")
@@ -244,6 +264,7 @@ def receive_block(block: dict, broadcast: bool = True):
     if incoming.previous_hash == blockchain.last_block.hash and proof_ok and economics_ok:
         blockchain.add_block(incoming)
         blockchain.pending_transactions = []
+        persist_chain()
         if broadcast:
             registry.broadcast_block(block)
         return {"message": "Block accepted", "index": incoming.index}
@@ -252,6 +273,7 @@ def receive_block(block: dict, broadcast: bool = True):
     if len(resolved) > len(blockchain.chain):
         blockchain.chain = resolved
         blockchain.pending_transactions = []
+        persist_chain()
         return {"message": "Fork resolved via longest chain", "length": len(blockchain.chain)}
 
     return {"message": "Block rejected, local chain retained", "length": len(blockchain.chain)}
@@ -343,6 +365,7 @@ def mine(miner_public_key: str, validator_signature: str = None):
 
     blockchain.add_block(candidate)
     blockchain.pending_transactions = remaining
+    persist_chain()
 
     mined_block = asdict(candidate)
     registry.broadcast_block(mined_block)
@@ -362,4 +385,5 @@ def resolve_nodes():
     if replaced:
         blockchain.chain = resolved
         blockchain.pending_transactions = []
+        persist_chain()
     return {"replaced": replaced, "length": len(blockchain.chain)}
