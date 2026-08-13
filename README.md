@@ -30,6 +30,28 @@ uvicorn app:app --reload --port 5000
 docker-compose up --build
 ```
 
+## Phase 12: the attack
+
+`scripts/attack_demo.py` runs a 51%-style double-spend against the 5-node network: an
+attacker pays a merchant on the honest, connected nodes (1-4) and the payment gets mined
+and is visible everywhere — meanwhile node5, isolated from the network *before* that
+payment ever happened, has been secretly mining a private fork containing a conflicting
+transaction that sends the same funds elsewhere. Once node5's private chain is longer and
+reconnects, the honest nodes' `/nodes/resolve` adopts it via the ordinary longest-valid-chain
+rule, and the merchant's payment simply disappears — no code was exploited, this is the
+protocol working exactly as designed. It works because "longest valid chain wins" is
+unconditional: nothing in this project treats a mined transaction as more final the longer
+it sits under other blocks. Real chains mitigate this by convention rather than protocol —
+merchants wait for multiple *confirmations* (additional blocks mined on top) before treating
+a payment as settled, since each extra confirmation means an attacker's private fork has to
+out-mine that much more honest work to still end up longer; a single confirmation is
+considered risky for exactly this reason, which is why high-value payments on Bitcoin
+typically wait for 6+.
+
+```bash
+python scripts/attack_demo.py
+```
+
 ## Done-when checkpoints
 
 - **Phase 1**: unit tests catch tampering — altering any past block's data breaks `is_chain_valid()`.
