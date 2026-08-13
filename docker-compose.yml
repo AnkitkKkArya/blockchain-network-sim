@@ -1,0 +1,61 @@
+# Phase 5. Spin up 5 node containers on a shared bridge network.
+# TODO once app.py's /nodes/register works: add a startup step (env var
+# SEED_PEERS, read in app.py) so each node auto-registers the others.
+#
+# Done-when: `docker-compose up --build`, then
+#   docker network disconnect blockchain-network-sim_default node3
+# ...node3 keeps mining alone; reconnect it and watch it resync via
+# resolve_conflicts() to whichever chain is now longest.
+
+# Every node must mint the same genesis block, or their chains fork at
+# block 0 before peering/longest-chain resolution ever gets a chance to
+# do anything. INITIAL_BALANCES is a throwaway wallet's PEM (this key's
+# private half isn't kept anywhere — it's just seed data, not a secret)
+# funded with 100.0, identical across all 5 services on purpose.
+x-initial-balances: &initial-balances
+  INITIAL_BALANCES: '{"-----BEGIN PUBLIC KEY-----\nMFYwEAYHKoZIzj0CAQYFK4EEAAoDQgAEVxVbizWZUIzP/OMOPfYWNFRPuqG4ZvyU\nLb6/+5miGM6l59zvZaFJ8+pCpuxyE/aosCN6ZcJ+SutOV4CzGwNfzg==\n-----END PUBLIC KEY-----\n":100.0}'
+
+services:
+  node1:
+    build: ./node
+    ports: ["5001:5000"]
+    environment:
+      <<: *initial-balances
+      SEED_PEERS: http://node2:5000,http://node3:5000
+    networks: [chainnet]
+
+  node2:
+    build: ./node
+    ports: ["5002:5000"]
+    environment:
+      <<: *initial-balances
+      SEED_PEERS: http://node1:5000,http://node3:5000
+    networks: [chainnet]
+
+  node3:
+    build: ./node
+    ports: ["5003:5000"]
+    environment:
+      <<: *initial-balances
+      SEED_PEERS: http://node1:5000,http://node2:5000
+    networks: [chainnet]
+
+  node4:
+    build: ./node
+    ports: ["5004:5000"]
+    environment:
+      <<: *initial-balances
+      SEED_PEERS: http://node1:5000,http://node2:5000,http://node3:5000
+    networks: [chainnet]
+
+  node5:
+    build: ./node
+    ports: ["5005:5000"]
+    environment:
+      <<: *initial-balances
+      SEED_PEERS: http://node1:5000,http://node2:5000,http://node3:5000
+    networks: [chainnet]
+
+networks:
+  chainnet:
+    driver: bridge
