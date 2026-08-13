@@ -245,6 +245,105 @@ class Blockchain:
         self.validator_proposals[key] = block_hash
         return False
 
+    def validate_block_economics(self, block: Block, running_balances: dict) -> bool:
+        """
+        Phase 13: economic validation for a block from an untrusted source
+        — a directly-received block (app.py's /blocks/receive) or any
+        block inside a candidate peer chain (p2p.py's resolve_conflicts,
+        via validate_chain_economics below). Neither of those previously
+        checked more than hash/PoW self-consistency
+        (is_chain_valid/is_valid_proof), so a forged signature, or two
+        transactions from one sender that individually fit their balance
+        but together overspend it within the same block, would have been
+        silently accepted as long as the chain was merely longer and
+        internally hash-consistent. This function must be correct standing
+        alone — it's exactly what an untrusted peer's block is checked
+        against, so nothing here assumes a signature was already verified
+        upstream (e.g. back when the transaction first entered some
+        node's mempool via add_transaction()).
+
+        running_balances is caller-maintained and mutated in place across
+        a whole sequence of blocks validated in chain order — an address's
+        balance is lazily seeded from self.get_balance() the first time
+        it's touched. That's exactly "confirmed balance up to but not
+        including this block" for both intended call patterns: a single
+        new block extending this node's own tip (self.chain already is
+        that confirmed prefix), or a full candidate chain validated
+        block-by-block starting at its own genesis (whose GENESIS
+        transactions credit running_balances directly, so nothing later
+        in that same chain ever needs the self.get_balance() fallback for
+        an address that chain itself funded).
+
+        A block with more than one COINBASE transaction is rejected — a
+        miner minting itself the reward twice, the inflation bug nothing
+        previously stopped. A block with zero COINBASE transactions is
+        not itself a violation: genesis has none (only GENESIS-sender
+        transactions), and Phase 11's slash() blocks have none either
+        (a single STAKE:-sender burn, not a mined block) — both are
+        legitimate and must still validate.
+        """
+        coinbase_transactions = [tx for tx in block.transactions if tx.get("from") == "COINBASE"]
+        if len(coinbase_transactions) > 1:
+            return False
+        if coinbase_transactions:
+            total_fees = sum(
+                tx.get("fee", 0) for tx in block.transactions if tx.get("from") != "COINBASE"
+            )
+            if coinbase_transactions[0].get("amount", 0) != self.BLOCK_REWARD + total_fees:
+                return False
+
+        for transaction in block.transactions:
+            sender = transaction.get("from")
+            recipient = transaction.get("to")
+            amount = transaction.get("amount", 0)
+            fee = transaction.get("fee", 0)
+
+            if sender == "GENESIS":
+                if block.index != 0:
+                    return False
+                running_balances[recipient] = (
+                    running_balances.get(recipient, self.get_balance(recipient)) + amount
+                )
+                continue
+
+            if sender == "COINBASE":
+                running_balances[recipient] = (
+                    running_balances.get(recipient, self.get_balance(recipient)) + amount
+                )
+                continue
+
+            if sender and sender.startswith("STAKE:") and recipient == self.BURN_ADDRESS:
+                # Phase 13: a legitimate slash() burn — system-initiated, so
+                # there's no validator signature to check (a validator never
+                # signs its own slashing). Unlike GENESIS/COINBASE, STAKE:
+                # is NOT unlimited minting: it's a real, balance-bound
+                # account, so the debit still has to be checked normally —
+                # otherwise a malicious peer could broadcast a chain with a
+                # forged burn draining more than was ever actually staked.
+                sender_balance = running_balances.get(sender, self.get_balance(sender))
+                if sender_balance < amount:
+                    return False
+                running_balances[sender] = sender_balance - amount
+                running_balances[recipient] = (
+                    running_balances.get(recipient, self.get_balance(recipient)) + amount
+                )
+                continue
+
+            signature = transaction.get("signature")
+            if not signature or not verify_signature(transaction, signature, sender):
+                return False
+
+            sender_balance = running_balances.get(sender, self.get_balance(sender))
+            if sender_balance < amount + fee:
+                return False
+
+            running_balances[sender] = sender_balance - amount - fee
+            running_balances[recipient] = (
+                running_balances.get(recipient, self.get_balance(recipient)) + amount
+            )
+
+        return True
+
     def add_block(self, block: Block) -> None:
         """
         Append a block the caller has already validated — proof-of-work
@@ -331,3 +430,23 @@ def validate_chain(chain: list) -> bool:
     resolve_conflicts(), before deciding whether to adopt it.
     """
     return Blockchain().is_chain_valid(chain)
+
+
+def validate_chain_economics(chain: list) -> bool:
+    """
+    Thin wrapper for callers (p2p.py) with a candidate chain but no live
+    Blockchain instance — validates every block in order, starting at
+    the candidate's own genesis, via a fresh Blockchain's
+    validate_block_economics(), threading one running_balances dict
+    through the whole chain so an address funded by an earlier block in
+    this same candidate chain is already known by the time a later block
+    spends it. A chain that's merely longer and structurally
+    self-consistent (validate_chain) is no longer enough to adopt —
+    every block in it must also pass this.
+    """
+    validator = Blockchain()
+    running_balances: dict = {}
+    for block in chain:
+        if not validator.validate_block_economics(block, running_balances):
+            return False
+    return True

@@ -172,6 +172,11 @@ def receive_block(block: dict, broadcast: bool = True):
     validator at the same index, the validator is slashed immediately and
     this block is rejected regardless of whether it would otherwise have
     extended our chain.
+
+    Phase 13: PoW/validator-signature validity and economic validity
+    (validate_block_economics — signatures on ordinary transactions,
+    same-block double-spends, coinbase inflation) are independent checks
+    and both must pass; passing one was never a substitute for the other.
     """
     incoming = Block(**block)
 
@@ -186,7 +191,9 @@ def receive_block(block: dict, broadcast: bool = True):
     else:
         proof_ok = is_valid_proof(incoming, blockchain.difficulty)
 
-    if incoming.previous_hash == blockchain.last_block.hash and proof_ok:
+    economics_ok = blockchain.validate_block_economics(incoming, {})
+
+    if incoming.previous_hash == blockchain.last_block.hash and proof_ok and economics_ok:
         blockchain.add_block(incoming)
         blockchain.pending_transactions = []
         if broadcast:

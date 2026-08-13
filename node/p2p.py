@@ -8,7 +8,7 @@ every known peer, let each validate independently.
 
 import requests
 
-from blockchain import Block, validate_chain
+from blockchain import Block, validate_chain, validate_chain_economics
 
 
 class PeerRegistry:
@@ -77,6 +77,12 @@ class PeerRegistry:
         into Block objects before validate_chain() can recompute hashes
         over them (compute_hash() is a Block method, not something that
         works on raw dicts).
+
+        Phase 13: a chain that's merely longer and structurally
+        self-consistent (validate_chain) is no longer sufficient to
+        adopt — validate_chain_economics also has to pass, or a longer
+        chain built on forged signatures or a same-block double-spend
+        would win purely on length.
         """
         longest_chain = local_chain
         max_length = len(local_chain)
@@ -89,7 +95,11 @@ class PeerRegistry:
                 continue
 
             peer_chain = [Block(**block) for block in response.json().get("chain", [])]
-            if len(peer_chain) > max_length and validate_chain(peer_chain):
+            if (
+                len(peer_chain) > max_length
+                and validate_chain(peer_chain)
+                and validate_chain_economics(peer_chain)
+            ):
                 max_length = len(peer_chain)
                 longest_chain = peer_chain
 
