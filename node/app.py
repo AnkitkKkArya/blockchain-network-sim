@@ -6,6 +6,7 @@ network node. Get this working with a single node first — no peers yet.
 """
 
 import json
+import logging
 import os
 import time
 from dataclasses import asdict
@@ -16,6 +17,8 @@ from consensus import is_valid_proof, proof_of_work, select_validator
 from merkle import merkle_proof
 from p2p import PeerRegistry
 from wallet import verify_signature
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -225,6 +228,28 @@ def get_peers():
     }
 
 
+@app.get("/status")
+def get_status():
+    """
+    Phase 17: one-shot operational snapshot — everything else (/chain,
+    /mempool, /peers, /validators) requires knowing which endpoint to
+    hit for which fact; this is the "is this node healthy" dashboard
+    view. active_validator_count is only meaningful (and only computed)
+    under CONSENSUS_MODE=pos — PoW mode has no notion of validators.
+    """
+    consensus_mode = os.environ.get("CONSENSUS_MODE", "pow")
+    status = {
+        "chain_length": len(blockchain.chain),
+        "difficulty": blockchain.difficulty,
+        "consensus_mode": consensus_mode,
+        "mempool_size": len(blockchain.pending_transactions),
+        "active_peer_count": len(registry.active_peers()),
+    }
+    if consensus_mode == "pos":
+        status["active_validator_count"] = len(blockchain.get_active_validators())
+    return status
+
+
 @app.post("/blocks/receive")
 def receive_block(block: dict, broadcast: bool = True):
     """
@@ -266,6 +291,11 @@ def receive_block(block: dict, broadcast: bool = True):
     if incoming.validator_public_key and blockchain.record_proposal(
         incoming.validator_public_key, incoming.index, incoming.hash
     ):
+        logger.warning(
+            "Equivocation detected for validator %s at index %d — slashed",
+            incoming.validator_public_key,
+            incoming.index,
+        )
         return {"message": "Equivocation detected, validator slashed", "index": incoming.index}
 
     if incoming.validator_public_key:
@@ -275,11 +305,13 @@ def receive_block(block: dict, broadcast: bool = True):
         proof_ok = is_valid_proof(incoming, blockchain.difficulty)
 
     economics_ok = blockchain.validate_block_economics(incoming, {})
+    extends_tip = incoming.previous_hash == blockchain.last_block.hash
 
-    if incoming.previous_hash == blockchain.last_block.hash and proof_ok and economics_ok:
+    if extends_tip and proof_ok and economics_ok:
         blockchain.add_block(incoming)
         blockchain.pending_transactions = []
         persist_chain()
+        logger.info("Block %d accepted (received from peer)", incoming.index)
         if broadcast:
             registry.broadcast_block(block)
         return {"message": "Block accepted", "index": incoming.index}
@@ -289,8 +321,19 @@ def receive_block(block: dict, broadcast: bool = True):
         blockchain.chain = resolved
         blockchain.pending_transactions = []
         persist_chain()
+        logger.info(
+            "Fork resolved via longest chain: adopted peer chain of length %d", len(blockchain.chain)
+        )
         return {"message": "Fork resolved via longest chain", "length": len(blockchain.chain)}
 
+    reasons = []
+    if not extends_tip:
+        reasons.append("does not extend local chain tip")
+    if not proof_ok:
+        reasons.append("failed PoW/validator-signature check")
+    if not economics_ok:
+        reasons.append("failed economic validation")
+    logger.warning("Block %d rejected: %s", incoming.index, "; ".join(reasons) or "unknown reason")
     return {"message": "Block rejected, local chain retained", "length": len(blockchain.chain)}
 
 
@@ -356,6 +399,11 @@ def mine(miner_public_key: str, validator_signature: str = None):
 
         selected_validator = select_validator(active_validators)
         if selected_validator != miner_public_key:
+            logger.warning(
+                "Mine rejected at index %d: %s is not the validator selected for this round",
+                candidate.index,
+                miner_public_key,
+            )
             raise HTTPException(
                 status_code=403, detail="Not the validator selected for this round"
             )
@@ -364,6 +412,7 @@ def mine(miner_public_key: str, validator_signature: str = None):
         if not validator_signature or not verify_signature(
             header, validator_signature, miner_public_key
         ):
+            logger.warning("Mine rejected at index %d: invalid validator signature", candidate.index)
             raise HTTPException(status_code=400, detail="Invalid or missing validator signature")
 
         candidate.hash = candidate.compute_hash()
@@ -371,6 +420,11 @@ def mine(miner_public_key: str, validator_signature: str = None):
         candidate.validator_signature = validator_signature
 
         if blockchain.record_proposal(miner_public_key, candidate.index, candidate.hash):
+            logger.warning(
+                "Equivocation detected for validator %s at index %d — slashed",
+                miner_public_key,
+                candidate.index,
+            )
             raise HTTPException(
                 status_code=403, detail="Equivocation detected — validator slashed"
             )
@@ -381,6 +435,7 @@ def mine(miner_public_key: str, validator_signature: str = None):
     blockchain.add_block(candidate)
     blockchain.pending_transactions = remaining
     persist_chain()
+    logger.info("Block %d accepted (mined locally)", candidate.index)
 
     mined_block = asdict(candidate)
     registry.broadcast_block(mined_block)
@@ -401,4 +456,7 @@ def resolve_nodes():
         blockchain.chain = resolved
         blockchain.pending_transactions = []
         persist_chain()
+        logger.info(
+            "Fork resolved via longest chain: adopted peer chain of length %d", len(blockchain.chain)
+        )
     return {"replaced": replaced, "length": len(blockchain.chain)}

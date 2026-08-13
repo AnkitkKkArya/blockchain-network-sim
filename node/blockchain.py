@@ -7,11 +7,14 @@ and unit-tested before moving to app.py (Phase 2).
 
 import hashlib
 import json
+import logging
 import time
 from dataclasses import asdict, dataclass, field
 
 from merkle import merkle_root as compute_merkle_root
 from wallet import verify_signature
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -233,6 +236,7 @@ class Blockchain:
         amount = self.get_balance(stake_address)
         if amount <= 0:
             return
+        logger.warning("Slashing validator %s: burning stake of %s", validator_public_key, amount)
         burn_transaction = {"from": stake_address, "to": self.BURN_ADDRESS, "amount": amount}
         block = Block(
             index=self.last_block.index + 1,
