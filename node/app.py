@@ -15,6 +15,7 @@ from fastapi import FastAPI, HTTPException
 from blockchain import Block, Blockchain
 from consensus import is_valid_proof, proof_of_work, select_validator
 from merkle import merkle_proof
+from merkle import merkle_root as compute_merkle_root
 from p2p import PeerRegistry
 from wallet import verify_signature
 
@@ -299,7 +300,14 @@ def receive_block(block: dict, broadcast: bool = True):
         return {"message": "Equivocation detected, validator slashed", "index": incoming.index}
 
     if incoming.validator_public_key:
-        header = {"index": incoming.index, "previous_hash": incoming.previous_hash}
+        # Phase B: matches what an honest /mine/submit actually signs —
+        # {index, previous_hash, merkle_root} — not the old two-field
+        # header, which didn't commit to the block's real content.
+        header = {
+            "index": incoming.index,
+            "previous_hash": incoming.previous_hash,
+            "merkle_root": incoming.merkle_root,
+        }
         proof_ok = verify_signature(header, incoming.validator_signature, incoming.validator_public_key)
     else:
         proof_ok = is_valid_proof(incoming, blockchain.difficulty)
@@ -337,38 +345,16 @@ def receive_block(block: dict, broadcast: bool = True):
     return {"message": "Block rejected, local chain retained", "length": len(blockchain.chain)}
 
 
-@app.get("/mine")
-def mine(miner_public_key: str, validator_signature: str = None):
+def _select_candidate_transactions(miner_public_key: str):
     """
-    Build a candidate block from whatever's in the mempool, then either
-    spend proof-of-work or (Phase 11, CONSENSUS_MODE=pos) get it signed
-    by the round's selected validator, and tell peers.
-
-    Candidate fields are all derived from current chain state (index and
-    previous_hash both come from last_block) rather than passed in —
-    a miner doesn't get to choose where its block attaches, only what
-    nonce makes it valid.
-
-    Phase 9: block size is capped at MAX_TRANSACTIONS_PER_BLOCK, so when
-    the mempool has more than that, the miner picks the highest-fee ones
-    first (stable sort preserves original mempool order as the tiebreak)
-    and leaves the rest pending for a future block rather than discarding
-    them. The miner is paid BLOCK_REWARD plus every included transaction's
-    fee, folded into one COINBASE transaction rather than paid out
-    per-transaction — see Blockchain.get_balance for why that's simpler.
-
-    Phase 11: CONSENSUS_MODE is read fresh here (not imported as a cached
-    constant from consensus.py) so a node's mode can't get stuck on
-    whatever it was at process startup. In "pos" mode, anyone can still
-    call this endpoint, but only the validator select_validator() actually
-    picked for this round succeeds — everyone else gets 403. That's what
-    makes the selection meaningful instead of decorative: the caller
-    proves it's really that validator by pre-signing the block's header
-    (index + previous_hash, the two fields it can know in advance) with
-    its own private key and passing the signature in, the same way a
-    transaction's signature is computed client-side and submitted. The
-    server never sees, needs, or could plausibly hold every validator's
-    private key.
+    Shared by /mine and /mine/propose: rank the mempool by fee (stable
+    sort preserves original mempool order as the tiebreak), keep up to
+    MAX_TRANSACTIONS_PER_BLOCK (Phase 9), and build the COINBASE paying
+    BLOCK_REWARD plus every included transaction's fee to miner_public_key.
+    Returns (selected, remaining, coinbase) — remaining is only meaningful
+    for /mine's own immediate mempool update; /mine/submit (Phase B)
+    recomputes what to clear from the mempool itself, since propose and
+    submit are two separate, stateless calls.
     """
     pending = blockchain.pending_transactions
     ranked_indices = sorted(
@@ -384,6 +370,35 @@ def mine(miner_public_key: str, validator_signature: str = None):
         "to": miner_public_key,
         "amount": Blockchain.BLOCK_REWARD + total_fees,
     }
+    return selected, remaining, coinbase
+
+
+@app.get("/mine")
+def mine(miner_public_key: str):
+    """
+    PoW-only. Build a candidate block from whatever's in the mempool,
+    spend the proof-of-work to earn the right to append it, then tell
+    peers.
+
+    Candidate fields are all derived from current chain state (index and
+    previous_hash both come from last_block) rather than passed in —
+    a miner doesn't get to choose where its block attaches, only what
+    nonce makes it valid.
+
+    Phase B: PoS mining moved to a separate two-step flow
+    (GET /mine/propose, POST /mine/submit) — the old single-call path
+    here only signed {index, previous_hash}, which never committed to
+    the block's actual transactions/coinbase recipient. Calling this
+    under CONSENSUS_MODE=pos now fails clearly rather than silently
+    doing something PoS-shaped.
+    """
+    if os.environ.get("CONSENSUS_MODE", "pow") == "pos":
+        raise HTTPException(
+            status_code=400,
+            detail="CONSENSUS_MODE is pos — use GET /mine/propose then POST /mine/submit instead",
+        )
+
+    selected, remaining, coinbase = _select_candidate_transactions(miner_public_key)
 
     candidate = Block(
         index=blockchain.last_block.index + 1,
@@ -391,49 +406,137 @@ def mine(miner_public_key: str, validator_signature: str = None):
         transactions=selected + [coinbase],
         previous_hash=blockchain.last_block.hash,
     )
-
-    if os.environ.get("CONSENSUS_MODE", "pow") == "pos":
-        active_validators = blockchain.get_active_validators()
-        if not active_validators:
-            raise HTTPException(status_code=400, detail="No active validators")
-
-        selected_validator = select_validator(active_validators)
-        if selected_validator != miner_public_key:
-            logger.warning(
-                "Mine rejected at index %d: %s is not the validator selected for this round",
-                candidate.index,
-                miner_public_key,
-            )
-            raise HTTPException(
-                status_code=403, detail="Not the validator selected for this round"
-            )
-
-        header = {"index": candidate.index, "previous_hash": candidate.previous_hash}
-        if not validator_signature or not verify_signature(
-            header, validator_signature, miner_public_key
-        ):
-            logger.warning("Mine rejected at index %d: invalid validator signature", candidate.index)
-            raise HTTPException(status_code=400, detail="Invalid or missing validator signature")
-
-        candidate.hash = candidate.compute_hash()
-        candidate.validator_public_key = miner_public_key
-        candidate.validator_signature = validator_signature
-
-        if blockchain.record_proposal(miner_public_key, candidate.index, candidate.hash):
-            logger.warning(
-                "Equivocation detected for validator %s at index %d — slashed",
-                miner_public_key,
-                candidate.index,
-            )
-            raise HTTPException(
-                status_code=403, detail="Equivocation detected — validator slashed"
-            )
-    else:
-        proof_of_work(candidate, blockchain.difficulty)
-        candidate.hash = candidate.compute_hash()
+    proof_of_work(candidate, blockchain.difficulty)
+    candidate.hash = candidate.compute_hash()
 
     blockchain.add_block(candidate)
     blockchain.pending_transactions = remaining
+    persist_chain()
+    logger.info("Block %d accepted (mined locally)", candidate.index)
+
+    mined_block = asdict(candidate)
+    registry.broadcast_block(mined_block)
+    return mined_block
+
+
+@app.get("/mine/propose")
+def mine_propose(miner_public_key: str):
+    """
+    Phase B step 1 of PoS mining. Runs the same mempool selection and
+    coinbase construction /mine uses, and returns the candidate's
+    content unsigned — commits nothing to the chain, mints nothing yet.
+    The caller (the round's selected validator) signs
+    {index, previous_hash, merkle_root} locally with its own private
+    key and submits that signature to /mine/submit to actually finalize
+    the block; the server never sees a private key.
+
+    Stateless: nothing here is cached for /mine/submit to look up later.
+    If the chain moves between propose and submit, submit just rejects
+    with a message to re-propose — there's nothing to reconcile.
+    """
+    if os.environ.get("CONSENSUS_MODE", "pow") != "pos":
+        raise HTTPException(status_code=400, detail="CONSENSUS_MODE is not pos")
+
+    active_validators = blockchain.get_active_validators()
+    if not active_validators:
+        raise HTTPException(status_code=400, detail="No active validators")
+
+    selected_validator = select_validator(active_validators)
+    if selected_validator != miner_public_key:
+        raise HTTPException(status_code=403, detail="Not the validator selected for this round")
+
+    selected, _remaining, coinbase = _select_candidate_transactions(miner_public_key)
+    transactions = selected + [coinbase]
+
+    return {
+        "index": blockchain.last_block.index + 1,
+        "previous_hash": blockchain.last_block.hash,
+        "merkle_root": compute_merkle_root(transactions),
+        "transactions": transactions,
+    }
+
+
+@app.post("/mine/submit")
+def mine_submit(payload: dict):
+    """
+    Phase B step 2 of PoS mining. Every field here is externally-supplied
+    input again once it's round-tripped through the caller — same trust
+    level as a block arriving from a peer via /blocks/receive — so
+    everything is re-validated from scratch, in order:
+
+    1. index/previous_hash still match our current tip — if the chain
+       moved since propose, reject and point the caller back to
+       /mine/propose rather than trying to reconcile stale content.
+    2. The submitted transactions actually hash to the claimed
+       merkle_root — this is the specific fix: the old single-call PoS
+       path only signed {index, previous_hash}, so a signature could in
+       principle be paired with different transactions/coinbase
+       recipient. Now the signature (step 4) covers merkle_root, and
+       this step ties merkle_root to real content.
+    3. miner_public_key is STILL this round's selected validator (the
+       active-validator set or the random draw could have changed since
+       propose).
+    4. validator_signature verifies against {index, previous_hash,
+       merkle_root} — the actual signed commitment.
+    5. The reconstructed block passes validate_block_economics() —
+       submitted transactions are untrusted input, not something already
+       checked just because they came from this validator.
+    """
+    index = payload.get("index")
+    previous_hash = payload.get("previous_hash")
+    claimed_merkle_root = payload.get("merkle_root")
+    transactions = payload.get("transactions", [])
+    validator_signature = payload.get("validator_signature")
+    miner_public_key = payload.get("miner_public_key")
+
+    if index != blockchain.last_block.index + 1 or previous_hash != blockchain.last_block.hash:
+        raise HTTPException(
+            status_code=409,
+            detail="Chain has moved since propose — re-propose via GET /mine/propose",
+        )
+
+    if compute_merkle_root(transactions) != claimed_merkle_root:
+        raise HTTPException(
+            status_code=400, detail="merkle_root does not match submitted transactions"
+        )
+
+    active_validators = blockchain.get_active_validators()
+    selected_validator = select_validator(active_validators)
+    if selected_validator != miner_public_key:
+        raise HTTPException(status_code=403, detail="Not the validator selected for this round")
+
+    header = {"index": index, "previous_hash": previous_hash, "merkle_root": claimed_merkle_root}
+    if not validator_signature or not verify_signature(header, validator_signature, miner_public_key):
+        raise HTTPException(status_code=400, detail="Invalid or missing validator signature")
+
+    candidate = Block(
+        index=index,
+        timestamp=time.time(),
+        transactions=transactions,
+        previous_hash=previous_hash,
+        merkle_root=claimed_merkle_root,
+    )
+    if not blockchain.validate_block_economics(candidate, {}):
+        logger.warning("Mine/submit rejected at index %d: failed economic validation", index)
+        raise HTTPException(status_code=400, detail="Submitted transactions failed economic validation")
+
+    candidate.hash = candidate.compute_hash()
+    candidate.validator_public_key = miner_public_key
+    candidate.validator_signature = validator_signature
+
+    if blockchain.record_proposal(miner_public_key, candidate.index, candidate.hash):
+        logger.warning(
+            "Equivocation detected for validator %s at index %d — slashed",
+            miner_public_key,
+            candidate.index,
+        )
+        raise HTTPException(status_code=403, detail="Equivocation detected — validator slashed")
+
+    blockchain.add_block(candidate)
+    included_transactions = [tx for tx in transactions if tx.get("from") != "COINBASE"]
+    blockchain.pending_transactions = [
+        tx for tx in blockchain.pending_transactions if tx not in included_transactions
+    ]
     persist_chain()
     logger.info("Block %d accepted (mined locally)", candidate.index)
 
