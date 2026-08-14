@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
- * Phase F2: prove a browser-compatible secp256k1 signing pipeline built
- * in JS produces signatures the existing Python backend's
- * wallet.verify_signature() actually accepts -- before any wallet UI
- * gets built on top of that assumption. Standalone: run with `node`,
- * not part of the Vite app / bundled into anything shipped.
+ * Phase F2 (+ Phase F3 Part 1): prove a browser-compatible secp256k1
+ * signing pipeline built in JS produces signatures the existing Python
+ * backend's wallet.verify_signature() actually accepts -- before any
+ * wallet UI gets built on top of that assumption. Standalone: run with
+ * `node`, not part of the Vite app / bundled into anything shipped.
  *
  * Library choice: @noble/curves (not `elliptic`).
  *   - Audited, actively maintained, zero runtime dependencies, and the
@@ -24,7 +24,19 @@
  * Python's ec.ECDSA(hashes.SHA256()). (An earlier version of this script
  * manually pre-hashed with @noble/hashes' sha256() AND left the default
  * prehash:true in place, silently double-hashing the payload -- see the
- * "double-hashing" note in main() for how that was diagnosed.)
+ * "double-hashing" note in runIntegerAmountTest() for how that was
+ * diagnosed.)
+ *
+ * Two scenarios run here:
+ *   1. Integer amount/fee (0/0), unfunded sender -- the original F2
+ *      proof. Doesn't need funding since amount+fee=0 never exceeds a
+ *      zero balance.
+ *   2. Non-integer amount/fee (4.5/0.5) -- Phase F3 Part 1's question:
+ *      does Python float formatting ("10.0") vs JS's ("10") diverge the
+ *      signed payload for realistic decimal amounts? The sender is
+ *      funded first by mining a block as itself (earning BLOCK_REWARD),
+ *      so a genuine 200 here proves both signature AND balance checks
+ *      passed -- not just "didn't get blocked by balance regardless".
  *
  * Usage:
  *   node scripts/verify_signing_compat.mjs
@@ -38,7 +50,7 @@ import { secp256k1 } from '@noble/curves/secp256k1.js';
 const NODE_URL = process.env.NODE_URL || 'http://localhost:5001';
 
 // ---------------------------------------------------------------------
-// Step 3: reproduce wallet.py's Wallet.public_key_pem EXACTLY.
+// Reproduce wallet.py's Wallet.public_key_pem EXACTLY.
 //
 // Confirmed against a real wallet.py-generated PEM, not assumed from a
 // spec reading:
@@ -79,8 +91,14 @@ function publicKeyToPem(uncompressedPublicKeyBytes) {
   return `-----BEGIN PUBLIC KEY-----\n${lines.join('\n')}\n-----END PUBLIC KEY-----\n`;
 }
 
+function generateWallet() {
+  const { secretKey } = secp256k1.keygen();
+  const publicKeyUncompressed = secp256k1.getPublicKey(secretKey, false); // false = uncompressed
+  return { secretKey, publicKeyPem: publicKeyToPem(publicKeyUncompressed) };
+}
+
 // ---------------------------------------------------------------------
-// Step 2: reproduce wallet.py's _signing_payload() EXACTLY.
+// Reproduce wallet.py's _signing_payload() EXACTLY.
 //
 //   core = {k: v for k, v in transaction.items() if k not in ("signature", "sender_public_key")}
 //   return json.dumps(core, sort_keys=True).encode()
@@ -89,15 +107,18 @@ function publicKeyToPem(uncompressedPublicKeyBytes) {
 // Python's DEFAULT separators, ", " and ": " -- with the spaces. That
 // is NOT what JSON.stringify produces (JS's default separators are
 // "," and ":", no spaces), so plain JSON.stringify(sortedObj) would
-// silently produce a byte-different payload and thus a signature that
-// verifies fine in JS but fails Python. Confirmed by inspecting actual
-// output:
+// silently produce a byte-different payload. Confirmed by inspecting
+// actual output:
 //   >>> json.dumps({"amount": 10, "from": "A"}, sort_keys=True)
 //   '{"amount": 10, "from": "A"}'
-// This only needs to handle flat dicts of strings/numbers, which is
-// all this project's transactions ever are -- see the note in main()
-// about float formatting for what a more general Phase F3 serializer
-// would additionally need to handle.
+//
+// Number formatting: JSON.stringify(4.5) === "4.5" and
+// json.dumps(4.5) === "4.5" -- both languages use a shortest
+// round-trip float-to-string algorithm and 4.5/0.5 are exactly
+// representable in binary, so there's no rounding ambiguity to worry
+// about for these values. See runFloatAmountTest()'s PASS/FAIL report
+// for the empirical confirmation (this comment predicts it; the test
+// is what actually proves it against the real backend).
 function pythonSortedJsonDumps(obj) {
   const keys = Object.keys(obj).sort();
   const parts = keys.map((key) => `${JSON.stringify(key)}: ${JSON.stringify(obj[key])}`);
@@ -109,29 +130,8 @@ function signingPayloadBytes(transaction) {
   return new TextEncoder().encode(pythonSortedJsonDumps(core));
 }
 
-async function main() {
-  console.log(`Verifying JS (@noble/curves secp256k1) <-> Python signature compatibility against ${NODE_URL}\n`);
-
-  // 1. Generate a secp256k1 key pair in JS.
-  const { secretKey } = secp256k1.keygen();
-  const publicKeyUncompressed = secp256k1.getPublicKey(secretKey, false); // false = uncompressed (0x04 || X || Y)
-  const publicKeyPem = publicKeyToPem(publicKeyUncompressed);
-  console.log('Generated public key (wallet.py-compatible PEM):');
-  console.log(publicKeyPem);
-
-  const recipientKeygen = secp256k1.keygen();
-  const recipientPem = publicKeyToPem(secp256k1.getPublicKey(recipientKeygen.secretKey, false));
-
-  // 2. Sign a test payload -- same shape and serialization as wallet.py.
-  // amount/fee are 0 so this passes add_transaction()'s balance check
-  // too (an unfunded, freshly-generated key has zero balance) -- the
-  // thing under test here is signature verification specifically, not
-  // funding this throwaway wallet first.
-  const transaction = { from: publicKeyPem, to: recipientPem, amount: 0, fee: 0 };
+function signTransaction(transaction, secretKey) {
   const payload = signingPayloadBytes(transaction);
-  console.log('Signing payload (must match Python\'s _signing_payload() byte-for-byte):');
-  console.log('  ' + new TextDecoder().decode(payload) + '\n');
-
   // Pass the RAW payload, not a pre-hashed digest: sign()/verify() default
   // to prehash:true and hash internally with SHA-256 for this curve --
   // matching Python's ec.ECDSA(hashes.SHA256()) exactly. Manually hashing
@@ -148,42 +148,32 @@ async function main() {
   // variable-length SEQUENCE{INTEGER r, INTEGER s}), and
   // wallet.verify_signature() expects DER via bytes.fromhex(signature).
   const signatureDerBytes = secp256k1.sign(payload, secretKey, { format: 'der' });
-  const signatureDerHex = Buffer.from(signatureDerBytes).toString('hex');
+  return { payload, signatureHex: Buffer.from(signatureDerBytes).toString('hex') };
+}
 
-  transaction.signature = signatureDerHex;
-  transaction.sender_public_key = publicKeyPem;
-
-  console.log(`DER-encoded signature, hex (${signatureDerHex.length / 2} bytes): ${signatureDerHex}\n`);
-
-  // 4. POST it to the running Python backend and confirm acceptance.
+async function postTransaction(transaction) {
   const response = await fetch(`${NODE_URL}/transactions/new?broadcast=false`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(transaction),
   });
+  return { status: response.status, body: await response.json() };
+}
+
+async function mine(minerPublicKeyPem) {
+  const response = await fetch(
+    `${NODE_URL}/mine?miner_public_key=${encodeURIComponent(minerPublicKeyPem)}`,
+  );
+  return { status: response.status, body: await response.json() };
+}
+
+async function getBalance(publicKeyPem) {
+  const response = await fetch(`${NODE_URL}/balance?public_key=${encodeURIComponent(publicKeyPem)}`);
   const body = await response.json();
+  return body.balance;
+}
 
-  console.log(`POST ${NODE_URL}/transactions/new -> HTTP ${response.status}`);
-  console.log(body);
-
-  if (response.status === 200) {
-    console.log('\nPASS: a signature produced entirely in JS (@noble/curves) was accepted by the');
-    console.log('existing Python wallet.verify_signature() with no format-conversion hacks.');
-    console.log(
-      'Note for Phase F3: this script sidesteps float formatting (amount=0 as an int on both',
-    );
-    console.log(
-      'sides) -- Python renders 10.0 as "10.0" while JSON.stringify(10.0) renders "10". Any',
-    );
-    console.log(
-      'transaction field that is a Python float must be serialized to match that exact string',
-    );
-    console.log('representation, or the signed payload bytes will diverge.');
-    process.exit(0);
-  }
-
-  console.error('\nFAIL: the Python backend rejected the JS-signed transaction.');
-  console.error(`Detail: ${body.detail ?? '(no detail field)'}`);
+function printDiagnosisChecklist() {
   console.error('\nDiagnosis checklist (don\'t paper over this -- find the actual cause):');
   console.error('  - Wrong rejection reason ("balance" instead of "signature")? That is NOT a');
   console.error('    crypto failure -- something else is wrong with this script\'s test setup.');
@@ -204,10 +194,127 @@ async function main() {
   console.error('      5. Payload serialization: log the exact payload bytes above and diff them');
   console.error('         against Python\'s json.dumps(core, sort_keys=True).encode() for the same');
   console.error('         transaction dict -- key order, separators, and number formatting all matter.');
-  process.exit(1);
+}
+
+// ---------------------------------------------------------------------
+// Scenario 1 (Phase F2): integer amount/fee, unfunded sender.
+async function runIntegerAmountTest() {
+  console.log('=== Test 1: integer amount/fee (0/0), unfunded sender ===\n');
+
+  const sender = generateWallet();
+  console.log('Generated public key (wallet.py-compatible PEM):');
+  console.log(sender.publicKeyPem);
+
+  const recipient = generateWallet();
+
+  // amount/fee are 0 so this passes add_transaction()'s balance check
+  // too (an unfunded, freshly-generated key has zero balance) -- the
+  // thing under test here is signature verification specifically, not
+  // funding this throwaway wallet first.
+  const transaction = { from: sender.publicKeyPem, to: recipient.publicKeyPem, amount: 0, fee: 0 };
+  const { payload, signatureHex } = signTransaction(transaction, sender.secretKey);
+  console.log("Signing payload (must match Python's _signing_payload() byte-for-byte):");
+  console.log('  ' + new TextDecoder().decode(payload) + '\n');
+  console.log(`DER-encoded signature, hex (${signatureHex.length / 2} bytes): ${signatureHex}\n`);
+
+  transaction.signature = signatureHex;
+  transaction.sender_public_key = sender.publicKeyPem;
+
+  const { status, body } = await postTransaction(transaction);
+  console.log(`POST ${NODE_URL}/transactions/new -> HTTP ${status}`);
+  console.log(body);
+
+  if (status === 200) {
+    console.log('\nPASS: a signature produced entirely in JS (@noble/curves) was accepted by the');
+    console.log('existing Python wallet.verify_signature() with no format-conversion hacks.\n');
+    return true;
+  }
+
+  console.error('\nFAIL: the Python backend rejected the JS-signed transaction.');
+  console.error(`Detail: ${body.detail ?? '(no detail field)'}`);
+  printDiagnosisChecklist();
+  return false;
+}
+
+// ---------------------------------------------------------------------
+// Scenario 2 (Phase F3 Part 1): non-integer amount/fee, funded sender.
+async function runFloatAmountTest() {
+  console.log('\n=== Test 2: non-integer amount/fee (4.5/0.5), funded sender ===\n');
+
+  const sender = generateWallet();
+  const recipient = generateWallet();
+
+  console.log(`Mining a block as the sender itself to fund it (BLOCK_REWARD)...`);
+  const mineResult = await mine(sender.publicKeyPem);
+  if (mineResult.status !== 200) {
+    console.error(`FAIL: could not fund the test sender -- mine() returned HTTP ${mineResult.status}`);
+    console.error(mineResult.body);
+    return false;
+  }
+  const balanceAfterMining = await getBalance(sender.publicKeyPem);
+  console.log(`Sender balance after mining: ${balanceAfterMining}\n`);
+
+  const transaction = { from: sender.publicKeyPem, to: recipient.publicKeyPem, amount: 4.5, fee: 0.5 };
+  const { payload, signatureHex } = signTransaction(transaction, sender.secretKey);
+  console.log("Signing payload (must match Python's _signing_payload() byte-for-byte):");
+  console.log('  ' + new TextDecoder().decode(payload) + '\n');
+  console.log(`DER-encoded signature, hex (${signatureHex.length / 2} bytes): ${signatureHex}\n`);
+
+  transaction.signature = signatureHex;
+  transaction.sender_public_key = sender.publicKeyPem;
+
+  const { status, body } = await postTransaction(transaction);
+  console.log(`POST ${NODE_URL}/transactions/new -> HTTP ${status}`);
+  console.log(body);
+
+  if (status === 200) {
+    console.log('\nPASS: a non-integer amount/fee (4.5/0.5), signed in JS, was accepted -- both the');
+    console.log('signature AND the balance check passed (sender was funded well above 5.0), so this');
+    console.log('is a genuine end-to-end pass, not just "balance blocked it before signature mattered".');
+    console.log('\nCONCLUSION: the int/float JSON-formatting concern does NOT affect client-signed');
+    console.log('amount/fee fields in practice. Both languages render 4.5 and 0.5 identically (shortest');
+    console.log('round-trip float-to-string, and both values are exactly representable in binary --');
+    console.log('no rounding ambiguity). BLOCK_REWARD\'s "10.0" vs "10" formatting difference is a');
+    console.log('server-side-only concern (the coinbase amount is never signed by any client) and');
+    console.log('never reaches this code path. No special number-formatting logic is needed in');
+    console.log('src/lib/crypto.js beyond the plain JSON.stringify already used for signing payload.\n');
+    return true;
+  }
+
+  if (body.detail && body.detail.toLowerCase().includes('balance')) {
+    console.error('\nFAIL (inconclusive): rejected for balance, not signature -- the sender was not');
+    console.error('funded enough. This is a test-setup bug, not a crypto compatibility finding.');
+    return false;
+  }
+
+  console.error('\nFAIL: the Python backend rejected the JS-signed non-integer transaction specifically');
+  console.error('for its signature. This means Python and JS produced BYTE-DIFFERENT signing payloads');
+  console.error('for a non-integer amount/fee -- diagnose the exact difference (compare the printed');
+  console.error('payload above against a Python-side dump of json.dumps(core, sort_keys=True) for the');
+  console.error('identical transaction dict) before building any wallet UI on this assumption.');
+  console.error(`Detail: ${body.detail ?? '(no detail field)'}`);
+  return false;
+}
+
+async function main() {
+  console.log(`Verifying JS (@noble/curves secp256k1) <-> Python signature compatibility against ${NODE_URL}\n`);
+
+  const integerPassed = await runIntegerAmountTest();
+  const floatPassed = await runFloatAmountTest();
+
+  console.log('\n=== Summary ===');
+  console.log(`Test 1 (integer amount/fee):     ${integerPassed ? 'PASS' : 'FAIL'}`);
+  console.log(`Test 2 (non-integer amount/fee): ${floatPassed ? 'PASS' : 'FAIL'}`);
+
+  // process.exitCode (not process.exit()) lets Node drain pending I/O
+  // (fetch's keep-alive sockets) before exiting naturally -- calling
+  // process.exit() here race-crashed with an open fetch handle on
+  // Windows (libuv assertion in src/win/async.c), a benign but noisy
+  // shutdown quirk unrelated to the actual test results.
+  process.exitCode = integerPassed && floatPassed ? 0 : 1;
 }
 
 main().catch((err) => {
   console.error('Script error:', err);
-  process.exit(1);
+  process.exitCode = 1;
 });

@@ -43,9 +43,9 @@ export default function Dashboard() {
           <StatusCard label="Difficulty" value={status.difficulty} accent="amber" />
           <StatusCard label="Consensus mode" value={status.consensus_mode} />
           <StatusCard label="Mempool size" value={status.mempool_size} />
-          <StatusCard label="Active peers" value={status.active_peers} accent="teal" />
+          <StatusCard label="Active peers" value={status.active_peer_count} accent="teal" />
           {status.consensus_mode === "pos" && (
-            <StatusCard label="Active validators" value={status.active_validators} accent="amber" />
+            <StatusCard label="Active validators" value={status.active_validator_count} accent="amber" />
           )}
         </div>
       )}

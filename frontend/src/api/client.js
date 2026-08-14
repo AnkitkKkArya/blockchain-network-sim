@@ -11,13 +11,24 @@
 import axios from "axios";
 
 export const DEFAULT_NODES = (
-  import.meta.env.VITE_NODE_URLS || "http://localhost:5001,http://localhost:5002,http://localhost:5003,http://localhost:5004,http://localhost:5005"
+  import.meta.env?.VITE_NODE_URLS || "http://localhost:5001,http://localhost:5002,http://localhost:5003,http://localhost:5004,http://localhost:5005"
 )
   .split(",")
   .map((url) => url.trim());
 
-function client(baseURL) {
-  return axios.create({ baseURL, timeout: 5000 });
+const DEFAULT_TIMEOUT_MS = 5000;
+// PoW mining searches for a nonce satisfying the current difficulty --
+// unlike every other endpoint here, its duration isn't bounded by network
+// latency, it's bounded by how long that search takes (observed: several
+// seconds at the default difficulty=4 under real load, occasionally
+// longer). The default timeout above is far too tight for it and would
+// abort a mine that's genuinely still in progress server-side (confirmed
+// by hand: a "timed out" mine() call had still landed the block on the
+// chain a moment later).
+const MINE_TIMEOUT_MS = 60000;
+
+function client(baseURL, timeout = DEFAULT_TIMEOUT_MS) {
+  return axios.create({ baseURL, timeout });
 }
 
 export async function getStatus(nodeUrl) {
@@ -52,7 +63,44 @@ export async function getBalance(nodeUrl, publicKeyPem) {
   return data;
 }
 
-// Phase F3 will add: submitTransaction, stake, mine/propose, mine/submit.
-// Not implemented yet — this file is read-only endpoints only, on purpose,
-// so F1 has zero risk of accidentally mutating chain state while just
-// building the dashboard.
+// --- Phase F3: mutating endpoints (wallet actions) ---
+
+export async function submitTransaction(nodeUrl, transaction) {
+  const { data } = await client(nodeUrl).post("/transactions/new", transaction);
+  return data;
+}
+
+export async function stake(nodeUrl, publicKeyPem, amount, signature) {
+  const { data } = await client(nodeUrl).post("/stake", null, {
+    params: { public_key: publicKeyPem, amount, signature },
+  });
+  return data;
+}
+
+// PoW mining. Returns 400 if the node is in CONSENSUS_MODE=pos — callers
+// should check getStatus(nodeUrl).consensus_mode first (see Wallet.jsx)
+// rather than relying on this failing to detect the mode.
+export async function mine(nodeUrl, minerPublicKeyPem) {
+  const { data } = await client(nodeUrl, MINE_TIMEOUT_MS).get("/mine", {
+    params: { miner_public_key: minerPublicKeyPem },
+  });
+  return data;
+}
+
+// PoS two-step flow, step 1: ask the node to build candidate block
+// content (mempool selection + coinbase) for miner_public_key, unsigned.
+// 403s if miner_public_key isn't this round's selected validator.
+export async function mineProposePoS(nodeUrl, minerPublicKeyPem) {
+  const { data } = await client(nodeUrl).get("/mine/propose", {
+    params: { miner_public_key: minerPublicKeyPem },
+  });
+  return data;
+}
+
+// PoS two-step flow, step 2: submit the validator's signature over
+// {index, previous_hash, merkle_root} from mineProposePoS's response,
+// finalizing the block.
+export async function mineSubmitPoS(nodeUrl, payload) {
+  const { data } = await client(nodeUrl).post("/mine/submit", payload);
+  return data;
+}
