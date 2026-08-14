@@ -289,16 +289,6 @@ def receive_block(block: dict, broadcast: bool = True):
     """
     incoming = Block(**block)
 
-    if incoming.validator_public_key and blockchain.record_proposal(
-        incoming.validator_public_key, incoming.index, incoming.hash
-    ):
-        logger.warning(
-            "Equivocation detected for validator %s at index %d — slashed",
-            incoming.validator_public_key,
-            incoming.index,
-        )
-        return {"message": "Equivocation detected, validator slashed", "index": incoming.index}
-
     if incoming.validator_public_key:
         # Phase B: matches what an honest /mine/submit actually signs —
         # {index, previous_hash, merkle_root} — not the old two-field
@@ -308,6 +298,16 @@ def receive_block(block: dict, broadcast: bool = True):
             "previous_hash": incoming.previous_hash,
             "merkle_root": incoming.merkle_root,
         }
+        if blockchain.record_proposal(
+            incoming.validator_public_key, incoming.index, header, incoming.validator_signature
+        ):
+            logger.warning(
+                "Equivocation detected for validator %s at index %d — slashed",
+                incoming.validator_public_key,
+                incoming.index,
+            )
+            return {"message": "Equivocation detected, validator slashed", "index": incoming.index}
+
         proof_ok = verify_signature(header, incoming.validator_signature, incoming.validator_public_key)
     else:
         proof_ok = is_valid_proof(incoming, blockchain.difficulty)
@@ -524,7 +524,7 @@ def mine_submit(payload: dict):
     candidate.validator_public_key = miner_public_key
     candidate.validator_signature = validator_signature
 
-    if blockchain.record_proposal(miner_public_key, candidate.index, candidate.hash):
+    if blockchain.record_proposal(miner_public_key, candidate.index, header, validator_signature):
         logger.warning(
             "Equivocation detected for validator %s at index %d — slashed",
             miner_public_key,

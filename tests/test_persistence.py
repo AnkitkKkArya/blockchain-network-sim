@@ -60,7 +60,8 @@ def test_save_and_load_round_trip_identical_chain_and_balances(tmp_path):
 
 def test_save_and_load_preserves_validator_proposals(tmp_path):
     bc = Blockchain()
-    bc.validator_proposals[("some-validator-pubkey", 3)] = "some-block-hash"
+    header = {"index": 3, "previous_hash": "abc", "merkle_root": "def"}
+    bc.validator_proposals[("some-validator-pubkey", 3)] = (header, "some-signature")
 
     storage_path = tmp_path / "chain.json"
     bc.save_to_disk(str(storage_path))

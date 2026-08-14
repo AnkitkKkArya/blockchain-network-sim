@@ -216,10 +216,14 @@ def test_equivocation_burns_stake_to_zero():
     assert bc.get_stake(validator.public_key_pem) == 900.0
 
     next_index = bc.last_block.index + 1
-    first_proposal = bc.record_proposal(validator.public_key_pem, next_index, "hash-a")
+    header_a = {"index": next_index, "previous_hash": "hash-a", "merkle_root": "root-a"}
+    signature_a = _sign_header(validator, next_index, "hash-a", "root-a")
+    first_proposal = bc.record_proposal(validator.public_key_pem, next_index, header_a, signature_a)
     assert first_proposal is False
     assert bc.get_stake(validator.public_key_pem) == 900.0
 
-    second_proposal = bc.record_proposal(validator.public_key_pem, next_index, "hash-b")
+    header_b = {"index": next_index, "previous_hash": "hash-b", "merkle_root": "root-b"}
+    signature_b = _sign_header(validator, next_index, "hash-b", "root-b")
+    second_proposal = bc.record_proposal(validator.public_key_pem, next_index, header_b, signature_b)
     assert second_proposal is True
     assert bc.get_stake(validator.public_key_pem) == 0.0

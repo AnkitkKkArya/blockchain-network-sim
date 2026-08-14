@@ -222,7 +222,7 @@ class Blockchain:
                     validators.add(sender)
         return {v: self.get_stake(v) for v in validators if self.get_stake(v) > 0}
 
-    def slash(self, validator_public_key: str):
+    def slash(self, validator_public_key: str, evidence: list = None):
         """
         Burns a validator's entire current stake by minting a transaction
         from its f"STAKE:{...}" address to BURN_ADDRESS directly into a new
@@ -232,13 +232,25 @@ class Blockchain:
         this is a protocol-level penalty the validator never agrees to,
         not a transfer it signs. It has to land on-chain immediately
         (not the mempool) since get_stake() only reads confirmed balance.
+
+        `evidence` (a list of {"header": ..., "signature": ...} entries,
+        from record_proposal's equivocation detection) is embedded
+        directly in the burn transaction so the slash is self-proving —
+        any peer that later sees this block can verify the equivocation
+        itself via verify_equivocation_evidence(), rather than having to
+        trust whichever node's word slashed the validator.
         """
         stake_address = f"STAKE:{validator_public_key}"
         amount = self.get_balance(stake_address)
         if amount <= 0:
             return
         logger.warning("Slashing validator %s: burning stake of %s", validator_public_key, amount)
-        burn_transaction = {"from": stake_address, "to": self.BURN_ADDRESS, "amount": amount}
+        burn_transaction = {
+            "from": stake_address,
+            "to": self.BURN_ADDRESS,
+            "amount": amount,
+            "equivocation_evidence": evidence or [],
+        }
         block = Block(
             index=self.last_block.index + 1,
             timestamp=time.time(),
@@ -248,7 +260,7 @@ class Blockchain:
         block.hash = block.compute_hash()
         self.add_block(block)
 
-    def record_proposal(self, validator_public_key: str, index: int, block_hash: str) -> bool:
+    def record_proposal(self, validator_public_key: str, index: int, header: dict, signature: str) -> bool:
         """
         Records a validator's block proposal at a given index, and
         returns True iff this call just revealed equivocation (slashing
@@ -257,13 +269,28 @@ class Blockchain:
         catches a validator handing two different blocks for the same
         index to two different peers, even though at most one of those
         blocks is ever accepted by any single node.
+
+        Compared by header CONTENT, not block.hash: block.hash includes
+        timestamp, which isn't part of what a validator actually signs
+        ({index, previous_hash, merkle_root}) — comparing by hash would
+        risk a false-positive equivocation on an honest resubmission
+        (e.g. a retried /mine/submit) that only differs in timestamp.
         """
         key = (validator_public_key, index)
-        seen_hash = self.validator_proposals.get(key)
-        if seen_hash is not None and seen_hash != block_hash:
-            self.slash(validator_public_key)
-            return True
-        self.validator_proposals[key] = block_hash
+        stored = self.validator_proposals.get(key)
+        if stored is not None:
+            stored_header, stored_signature = stored
+            if header != stored_header:
+                self.slash(
+                    validator_public_key,
+                    evidence=[
+                        {"header": stored_header, "signature": stored_signature},
+                        {"header": header, "signature": signature},
+                    ],
+                )
+                return True
+            return False
+        self.validator_proposals[key] = (header, signature)
         return False
 
     def validate_block_economics(self, block: Block, running_balances: dict) -> bool:
@@ -385,13 +412,14 @@ class Blockchain:
 
         validator_proposals' keys are (validator_public_key, index)
         tuples, which JSON can't use as object keys, so they're written
-        out as a list of {validator, index, hash} entries instead.
+        out as a list of {validator, index, header, signature} entries
+        instead.
         """
         data = {
             "chain": [asdict(block) for block in self.chain],
             "validator_proposals": [
-                {"validator": validator, "index": index, "hash": block_hash}
-                for (validator, index), block_hash in self.validator_proposals.items()
+                {"validator": validator, "index": index, "header": header, "signature": signature}
+                for (validator, index), (header, signature) in self.validator_proposals.items()
             ],
             "difficulty": self.difficulty,
         }
@@ -414,7 +442,7 @@ class Blockchain:
         blockchain.pending_transactions = []
         blockchain.difficulty = data.get("difficulty", 4)
         blockchain.validator_proposals = {
-            (entry["validator"], entry["index"]): entry["hash"]
+            (entry["validator"], entry["index"]): (entry["header"], entry["signature"])
             for entry in data.get("validator_proposals", [])
         }
         return blockchain
@@ -536,24 +564,67 @@ def validate_chain_economics(chain: list) -> bool:
     return True
 
 
+def verify_equivocation_evidence(validator_public_key: str, evidence: list) -> bool:
+    """
+    True only if `evidence` cryptographically proves validator_public_key
+    equivocated: exactly two {"header": ..., "signature": ...} entries,
+    each signature verifying against its own header and
+    validator_public_key, both headers claiming the same block index,
+    and the two headers not identical. This is what turns "someone
+    claims equivocation happened" into "equivocation is provable from
+    the burn transaction alone" — a peer doesn't have to trust whichever
+    node produced the slash, or have witnessed both original proposals
+    itself.
+    """
+    if not isinstance(evidence, list) or len(evidence) != 2:
+        return False
+
+    headers = []
+    for entry in evidence:
+        if not isinstance(entry, dict):
+            return False
+        header = entry.get("header")
+        signature = entry.get("signature")
+        if not isinstance(header, dict) or not signature:
+            return False
+        if not verify_signature(header, signature, validator_public_key):
+            return False
+        headers.append(header)
+
+    if headers[0].get("index") != headers[1].get("index"):
+        return False
+    if headers[0] == headers[1]:
+        return False
+    return True
+
+
 def _is_slash_block(block: Block) -> bool:
     """
-    Recognizes a Blockchain.slash() burn block: one STAKE:-sender
-    transaction to BURN_ADDRESS, no validator. These are minted directly
-    by slash() rather than mined (PoW) or validator-signed (PoS) — same
-    reasoning as validate_block_economics' STAKE:/BURNED exemption
-    (Phase 13) applied to proof validation instead of economics. Without
-    this, a completely legitimate chain containing a real equivocation
-    slash would be rejected by every peer's resolve_conflicts() as
-    "unmined", which is a correctness regression this function must not
-    introduce.
+    Recognizes a legitimate Blockchain.slash() burn block: one
+    STAKE:-sender transaction to BURN_ADDRESS, no validator, AND
+    cryptographically-verifiable equivocation_evidence for the
+    validator recovered from the STAKE:<key> sender field. These are
+    minted directly by slash() rather than mined (PoW) or
+    validator-signed (PoS) — same reasoning as validate_block_economics'
+    STAKE:/BURNED exemption (Phase 13) applied to proof validation
+    instead of economics. Without the shape check, a completely
+    legitimate chain containing a real equivocation slash would be
+    rejected by every peer's resolve_conflicts() as "unmined". Without
+    the evidence check, that shape alone would be a free pass to burn
+    ANY validator's stake with a forged, unmined block — the evidence
+    requirement is what makes this an exemption for *proven*
+    equivocation specifically, not for the shape alone.
     """
-    return (
-        not block.validator_public_key
-        and len(block.transactions) == 1
-        and str(block.transactions[0].get("from", "")).startswith("STAKE:")
-        and block.transactions[0].get("to") == Blockchain.BURN_ADDRESS
-    )
+    if block.validator_public_key or len(block.transactions) != 1:
+        return False
+    transaction = block.transactions[0]
+    sender = transaction.get("from", "")
+    if not isinstance(sender, str) or not sender.startswith("STAKE:"):
+        return False
+    if transaction.get("to") != Blockchain.BURN_ADDRESS:
+        return False
+    slashed_validator = sender[len("STAKE:") :]
+    return verify_equivocation_evidence(slashed_validator, transaction.get("equivocation_evidence", []))
 
 
 def validate_chain_proof(chain: list) -> bool:
