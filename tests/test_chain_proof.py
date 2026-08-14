@@ -29,6 +29,27 @@ def _mine_block(bc: Blockchain) -> Block:
     return block
 
 
+def _mine_block_with_timestamp(bc: Blockchain, timestamp: float) -> Block:
+    """
+    Same real proof-of-work mining as _mine_block, but the timestamp is
+    fixed BEFORE mining rather than taken from time.time() — so the
+    nonce proof_of_work finds is valid for that exact timestamp from the
+    start, with no re-mining needed. Used where a test needs deterministic
+    control over elapsed time (e.g. to trigger adjust_difficulty()
+    predictably) rather than depending on real wall-clock mining speed.
+    """
+    block = Block(
+        index=bc.last_block.index + 1,
+        timestamp=timestamp,
+        transactions=[],
+        previous_hash=bc.last_block.hash,
+    )
+    proof_of_work(block, bc.difficulty)
+    block.hash = block.compute_hash()
+    bc.add_block(block)
+    return block
+
+
 def test_honestly_mined_chain_passes():
     # Real default difficulty (4), not lowered: validate_chain_proof's
     # accumulator always starts at the class default, since that's what
@@ -107,20 +128,28 @@ def test_resolve_conflicts_rejects_chain_with_fabricated_nonces(monkeypatch):
 def test_validates_correctly_across_a_difficulty_adjustment_boundary():
     """
     Mines past ADJUSTMENT_INTERVAL*2 blocks at the real starting
-    difficulty (mining this fast easily triggers the "too fast, raise
-    difficulty" branch — see test_difficulty.py), so adjust_difficulty()
-    actually fires at least once mid-chain. validate_chain_proof must
-    replay that same difficulty evolution — checking each block against
-    whatever difficulty was in effect *at that point*, not the chain's
-    final difficulty — for later blocks (mined at the new difficulty) to
-    validate correctly. Not lowering difficulty here (unlike
-    test_difficulty.py) since validate_chain_proof's accumulator always
-    starts at the real class default — see test_honestly_mined_chain_passes.
+    difficulty, so adjust_difficulty() fires at least once mid-chain.
+    validate_chain_proof must replay that same difficulty evolution —
+    checking each block against whatever difficulty was in effect *at
+    that point*, not the chain's final difficulty — for later blocks
+    (mined at the new difficulty) to validate correctly. Not lowering
+    difficulty here (unlike test_difficulty.py) since validate_chain_proof's
+    accumulator always starts at the real class default — see
+    test_honestly_mined_chain_passes.
+
+    Each block still gets a genuine proof_of_work nonce, but its
+    timestamp is synthetic (fixed before mining, well under
+    TARGET_BLOCK_TIME) rather than time.time() — real wall-clock mining
+    speed at difficulty=4 depends on this machine's load at test time,
+    which made whether adjust_difficulty()'s "too fast" branch actually
+    fired nondeterministic (and thus flaky). A synthetic, tightly-spaced
+    timestamp sequence makes "mined too fast" true by construction.
     """
     bc = Blockchain()
+    timestamp_increment = 0.01  # seconds, well under TARGET_BLOCK_TIME (2s)
 
-    for _ in range(2 * Blockchain.ADJUSTMENT_INTERVAL):
-        _mine_block(bc)
+    for i in range(1, 2 * Blockchain.ADJUSTMENT_INTERVAL + 1):
+        _mine_block_with_timestamp(bc, i * timestamp_increment)
 
     assert bc.difficulty > 4  # sanity: an adjustment actually happened
     assert validate_chain_proof(bc.chain) is True
