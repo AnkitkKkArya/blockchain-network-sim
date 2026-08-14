@@ -11,6 +11,7 @@ import logging
 import time
 from dataclasses import asdict, dataclass, field
 
+from consensus import is_valid_proof
 from merkle import merkle_root as compute_merkle_root
 from wallet import verify_signature
 
@@ -532,4 +533,74 @@ def validate_chain_economics(chain: list) -> bool:
     for block in chain:
         if not validator.validate_block_economics(block, running_balances):
             return False
+    return True
+
+
+def _is_slash_block(block: Block) -> bool:
+    """
+    Recognizes a Blockchain.slash() burn block: one STAKE:-sender
+    transaction to BURN_ADDRESS, no validator. These are minted directly
+    by slash() rather than mined (PoW) or validator-signed (PoS) — same
+    reasoning as validate_block_economics' STAKE:/BURNED exemption
+    (Phase 13) applied to proof validation instead of economics. Without
+    this, a completely legitimate chain containing a real equivocation
+    slash would be rejected by every peer's resolve_conflicts() as
+    "unmined", which is a correctness regression this function must not
+    introduce.
+    """
+    return (
+        not block.validator_public_key
+        and len(block.transactions) == 1
+        and str(block.transactions[0].get("from", "")).startswith("STAKE:")
+        and block.transactions[0].get("to") == Blockchain.BURN_ADDRESS
+    )
+
+
+def validate_chain_proof(chain: list) -> bool:
+    """
+    Confirms every block in a candidate chain actually satisfies
+    proof-of-work (or carries a valid validator signature, for PoS
+    blocks) — validate_chain() only checks hash self-consistency and
+    linkage, and validate_chain_economics() only checks transaction
+    signatures/balances; neither confirms a block was ever actually
+    mined. Without this, a candidate chain with fabricated nonces
+    (never mined at all) but otherwise hash-consistent and economically
+    valid would be adopted purely for being longer.
+
+    Difficulty adjusts over the chain's own history (adjust_difficulty(),
+    every ADJUSTMENT_INTERVAL blocks), so "was block N validly mined"
+    depends on what difficulty was in effect *within this candidate
+    chain* at block N — not this node's current difficulty, which
+    reflects a possibly different chain. Replaying the candidate through
+    a fresh accumulator Blockchain via the same add_block() that real
+    mining/receiving already uses is what keeps that difficulty history
+    correct: each block is checked against accumulator.difficulty as it
+    stood after the previous block, then add_block() advances it
+    (via adjust_difficulty()) before the next block is checked.
+
+    The candidate's own genesis (index 0) needs no check — same
+    special-case as is_chain_valid().
+    """
+    if not chain:
+        return True
+
+    accumulator = Blockchain()
+    accumulator.chain = [chain[0]]  # discard the accumulator's own genesis; use the candidate's
+
+    for block in chain[1:]:
+        if block.validator_public_key:
+            header = {
+                "index": block.index,
+                "previous_hash": block.previous_hash,
+                "merkle_root": block.merkle_root,
+            }
+            if not verify_signature(header, block.validator_signature, block.validator_public_key):
+                return False
+        elif _is_slash_block(block):
+            pass
+        elif not is_valid_proof(block, accumulator.difficulty):
+            return False
+
+        accumulator.add_block(block)
+
     return True

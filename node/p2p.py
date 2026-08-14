@@ -8,7 +8,7 @@ every known peer, let each validate independently.
 
 import requests
 
-from blockchain import Block, validate_chain, validate_chain_economics
+from blockchain import Block, validate_chain, validate_chain_economics, validate_chain_proof
 
 
 class PeerRegistry:
@@ -119,6 +119,11 @@ class PeerRegistry:
         adopt — validate_chain_economics also has to pass, or a longer
         chain built on forged signatures or a same-block double-spend
         would win purely on length.
+
+        Phase A: neither of those confirms a block was ever actually
+        mined (or, for a PoS block, validator-signed) — validate_chain_proof
+        also has to pass, or a longer chain with fabricated nonces would
+        still win on length alone.
         """
         longest_chain = local_chain
         max_length = len(local_chain)
@@ -137,6 +142,7 @@ class PeerRegistry:
                 len(peer_chain) > max_length
                 and validate_chain(peer_chain)
                 and validate_chain_economics(peer_chain)
+                and validate_chain_proof(peer_chain)
             ):
                 max_length = len(peer_chain)
                 longest_chain = peer_chain
